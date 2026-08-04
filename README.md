@@ -1,12 +1,13 @@
-# Coin Dash Online — Authoritative Server v2.0.2
+# Coin Dash Online — Authoritative Server v2.0.3
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.3. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.4. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.4.3
-- Server: v2.0.1
-- Multiplayer protocol: 9
+- Client: Coin Dash v1.4.4
+- Server: v2.0.3
+- Multiplayer protocol: 10
+- Engine revision: `foundry-2026-08-04-r1`
 
 The client and server must be deployed together.
 
@@ -22,8 +23,9 @@ Expected health response:
   "ok": true,
   "service": "coin-dash-online",
   "mode": "authoritative",
-  "protocol": 9,
-  "version": 5
+  "protocol": 10,
+  "version": 6,
+  "engine": "foundry-2026-08-04-r1"
 }
 ```
 
@@ -45,18 +47,23 @@ Keep an existing `package-lock.json` if the repository already has one.
 1. Upload the five files above to the root of the existing `coin-dash-online` GitHub repository.
 2. Commit directly to the production branch already connected to Cloudflare.
 3. Wait for the Cloudflare build to show Success.
-4. Open the health-check address and confirm protocol 9 before uploading the matching client.
+4. Open the health-check address and confirm protocol 10, version 6, and the matching engine revision before uploading the client.
 
-## v2.0.2 fixes
+## v2.0.3 fixes
 
-- Online menus and chat are local overlays and never pause the authoritative match.
-- Older clients that still send pause or resume messages cannot pause the room.
-- Lobby level and difficulty edits preserve connected players’ Ready status.
-- Removed the redundant full-state setup event for ordinary lobby setting changes.
-- Restored active persisted matches as unpaused after a Worker wake.
+- Input packet, dash, and special-power sequences reset safely for each WebSocket connection generation, so a reloaded player can move immediately.
+- Added authoritative `startLevel` support for Change Level, Play Again, Next Bonus, and result-screen level selection.
+- Added room-owner migration after a short reconnect grace period.
+- Owner readiness checks follow the current owner instead of assuming Player 1 is always the owner.
+- Disconnected players are excluded from enemy targeting, hazards, completion checks, and public connected state.
+- Fire patches are sent once as sequenced reliable events instead of being repeated in every motion packet.
+- Full correction snapshots were reduced to 4 Hz while compact motion remains 30 Hz.
+- Added per-socket and per-room limits for input, sync, chat, ping, and control messages.
+- Removed obsolete host-era readiness and fire-delivery assumptions.
+- Client and server verify the same engine revision before a session is accepted.
 
 ## Architecture
 
-The `GameRoom` Durable Object owns the lobby, players, level, difficulty, movement, dash validation, powers, health, coins, enemies, bosses, hazards, scoring, transitions, chat, reconnection, and room persistence. The person selecting Host Online remains the lobby owner but is not the network host.
+The `GameRoom` Durable Object owns the lobby, players, current owner, level, difficulty, movement, dash validation, powers, health, coins, enemies, bosses, hazards, scoring, transitions, chat, reconnection, and room persistence. The person selecting Host Online initially becomes room owner but is never the network host. Ownership can transfer to another connected player if the owner does not reconnect.
 
 No WebRTC, SDP, ICE, peer DataChannels, or TURN endpoint is used.

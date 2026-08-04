@@ -5,12 +5,21 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 9;
+const PROTOCOL_VERSION = 10;
+const ENGINE_REVISION = "foundry-2026-08-04-r1";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
-const STATE_INTERVAL_MS = 1000 / 10;
+const STATE_INTERVAL_MS = 1000 / 4;
 const PERSIST_INTERVAL_MS = 10_000;
 const MAX_CATCHUP_STEPS = 6;
+const OWNER_GRACE_MS = 7_000;
+const RATE_WINDOWS = {
+  input: { limit: 50, windowMs: 1000 },
+  ping: { limit: 6, windowMs: 3000 },
+  sync: { limit: 3, windowMs: 3000 },
+  chat: { limit: 6, windowMs: 10_000 },
+  control: { limit: 18, windowMs: 3000 },
+};
 
 function allowedOrigins(env) {
   const configured = String(env.GAME_ORIGIN || GAME_ORIGIN)
@@ -102,7 +111,8 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 5,
+        version: 6,
+        engine: ENGINE_REVISION,
       });
     }
 
@@ -138,6 +148,7 @@ export class GameRoom {
     this.engine = createGameEngine({
       event: (kind) => this.onEngineEvent(kind),
       sfx: (message) => this.broadcast(message),
+      fire: (row) => this.broadcastFire(row),
     });
     this.chat = [];
     this.loopTimer = null;
@@ -148,6 +159,10 @@ export class GameRoom {
     this.lastMotionAt = 0;
     this.lastStateAt = 0;
     this.lastPersistAt = 0;
+    this.fireEventSeq = 0;
+    this.ownerMigrationTimer = null;
+    this.rateBuckets = new Map();
+    this.roomRateBuckets = new Map();
     this.initialized = false;
     this.loading = this.ctx.blockConcurrencyWhile(async () => {
       await this.load();
@@ -160,6 +175,7 @@ export class GameRoom {
     this.meta = stored.get("meta") || null;
     this.chat = Array.isArray(stored.get("chat")) ? stored.get("chat").slice(-30) : [];
     if (!this.meta) return;
+    this.normalizeMeta();
 
     const liveIds = new Set();
     for (const socket of this.ctx.getWebSockets()) {
@@ -179,6 +195,7 @@ export class GameRoom {
       for (const row of roster) if (row.connected) this.engine.setConnectedPlayer(row.id, true);
     }
 
+    if (liveIds.size && !this.ownerConnected()) this.maybeMigrateOwner();
     if (this.engine.game.phase !== "menu" && !this.engine.game.over && liveIds.size) this.startLoop();
   }
 
@@ -192,6 +209,8 @@ export class GameRoom {
       this.meta = {
         createdAt: now,
         ownerClient: "",
+        ownerId: -1,
+        ownerDisconnectedAt: 0,
         level: 1,
         difficulty: "normal",
         ready: { 0: true },
@@ -213,27 +232,30 @@ export class GameRoom {
     const clientId = safeClientId(url.searchParams.get("client"));
     if (!clientId) return json(request, this.env, { error: "Missing client ID." }, 400);
 
+    this.normalizeMeta();
     let id;
-    if (requestedRole === "host") {
+    const existing = this.meta.slots[clientId];
+    if (existing && Number.isInteger(existing.id)) {
+      id = existing.id;
+    } else if (requestedRole === "host") {
       if (this.meta.ownerClient && this.meta.ownerClient !== clientId) {
         return json(request, this.env, { error: "Room already has an owner." }, 409);
       }
-      this.meta.ownerClient = clientId;
       id = 0;
+      this.meta.ownerClient = clientId;
+      this.meta.ownerId = id;
+      this.meta.ownerDisconnectedAt = 0;
+      this.meta.slots[clientId] = { id, lastSeen: Date.now() };
     } else {
-      const existing = this.meta.slots[clientId];
-      if (existing && Number.isInteger(existing.id)) id = existing.id;
-      else {
-        const used = new Set(Object.values(this.meta.slots).map((slot) => slot.id));
-        for (let candidate = 1; candidate < MAX_PLAYERS; candidate += 1) {
-          if (!used.has(candidate)) {
-            id = candidate;
-            break;
-          }
+      const used = new Set(Object.values(this.meta.slots).map((slot) => slot.id));
+      for (let candidate = 0; candidate < MAX_PLAYERS; candidate += 1) {
+        if (!used.has(candidate)) {
+          id = candidate;
+          break;
         }
-        if (!Number.isInteger(id)) return json(request, this.env, { error: "Room is full." }, 409);
-        this.meta.slots[clientId] = { id, lastSeen: Date.now() };
       }
+      if (!Number.isInteger(id)) return json(request, this.env, { error: "Room is full." }, 409);
+      this.meta.slots[clientId] = { id, lastSeen: Date.now() };
     }
 
     for (const oldSocket of this.ctx.getWebSockets()) {
@@ -248,26 +270,35 @@ export class GameRoom {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
+    const connectionId = crypto.randomUUID();
     const attachment = {
       id,
-      role: id === 0 ? "host" : "player",
+      role: this.isOwner(id, clientId) ? "host" : "player",
+      owner: this.isOwner(id, clientId),
       clientId,
+      connectionId,
       connectedAt: Date.now(),
       replaced: false,
     };
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server);
 
-    this.engine.setConnectedPlayer(id, true);
-    if (id === 0) this.meta.ready[0] = true;
-    else if (this.meta.ready[id] !== true) this.meta.ready[id] = false;
+    this.engine.setConnectedPlayer(id, true, connectionId);
+    if (this.isOwner(id, clientId)) {
+      this.meta.ready[id] = true;
+      this.meta.ownerDisconnectedAt = 0;
+      this.cancelOwnerMigration();
+    } else if (this.meta.ready[id] !== true) this.meta.ready[id] = false;
     if (this.meta.slots[clientId]) this.meta.slots[clientId].lastSeen = Date.now();
 
     this.send(server, {
       t: "welcome",
       pv: PROTOCOL_VERSION,
       id,
-      owner: id === 0,
+      owner: this.isOwner(id, clientId),
+      ownerId: this.meta.ownerId,
+      connectionId,
+      engine: ENGINE_REVISION,
       epoch: this.engine.epoch(),
       eventSeq: 0,
       g: this.engine.fullState(),
@@ -277,9 +308,11 @@ export class GameRoom {
     this.broadcast({
       t: "notice",
       tone: "success",
-      text: id === 0 ? "ROOM OWNER CONNECTED" : `P${id + 1} CONNECTED`,
+      text: this.isOwner(id, clientId) ? "ROOM OWNER CONNECTED" : `P${id + 1} CONNECTED`,
     }, server);
     this.broadcastLobby();
+    this.maybeMigrateOwner();
+    if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
     this.schedulePersist();
 
     return new Response(null, { status: 101, webSocket: client });
@@ -310,9 +343,11 @@ export class GameRoom {
     const id = Number.isInteger(member.id) ? member.id : -1;
     if (id < 0) return;
 
-    this.engine.wake();
+    this.maybeMigrateOwner();
 
     if (payload.t === "ping") {
+      if (!this.allowMessage(member, "ping")) return;
+      this.engine.wake();
       this.send(socket, { t: "pong", at: Number(payload.at) || Date.now(), serverAt: Date.now() });
       return;
     }
@@ -322,19 +357,27 @@ export class GameRoom {
       return;
     }
 
+    this.engine.wake();
+    const owner = this.isOwner(id, member.clientId);
+    const rateType = payload.t === "input" ? "input" : payload.t === "sync" ? "sync" : payload.t === "chat" ? "chat" : "control";
+    if (!this.allowMessage(member, rateType) || !this.allowRoomMessage(rateType)) {
+      if (payload.t === "chat") this.send(socket, { t: "notice", tone: "error", text: "CHAT IS MOVING TOO FAST" });
+      return;
+    }
+
     switch (payload.t) {
       case "input":
-        this.engine.setInput(id, payload.v, payload.seq);
+        this.engine.setInput(id, payload.v, payload.seq, member.connectionId);
         break;
       case "ready":
-        if (id > 0 && this.engine.game.phase === "menu") {
+        if (!owner && this.engine.game.phase === "menu") {
           this.meta.ready[id] = !!payload.ready;
           this.broadcastLobby();
           this.schedulePersist();
         }
         break;
       case "settings":
-        if (id === 0 && this.engine.game.phase === "menu") {
+        if (owner && this.engine.game.phase === "menu") {
           const settings = this.engine.setSettings(payload.difficulty, payload.level);
           this.meta.difficulty = settings.difficulty;
           this.meta.level = settings.level;
@@ -343,8 +386,8 @@ export class GameRoom {
         }
         break;
       case "start":
-        if (id === 0 && this.engine.game.phase === "menu") {
-          const waiting = this.connectedPlayerIds().filter((playerId) => playerId > 0 && !this.meta.ready[playerId]);
+        if (owner && this.engine.game.phase === "menu") {
+          const waiting = this.connectedPlayerIds().filter((playerId) => playerId !== this.meta.ownerId && !this.meta.ready[playerId]);
           if (waiting.length) {
             this.send(socket, { t: "notice", tone: "pending", text: `WAITING FOR ${waiting.map((playerId) => `P${playerId + 1}`).join(", ")}` });
             break;
@@ -354,20 +397,31 @@ export class GameRoom {
           this.schedulePersist(true);
         }
         break;
+      case "startLevel":
+        if (owner && this.engine.game.phase !== "menu") {
+          const settings = this.engine.setSettings(payload.difficulty, payload.level);
+          this.meta.difficulty = settings.difficulty;
+          this.meta.level = settings.level;
+          this.engine.startRun(settings.difficulty, settings.level);
+          this.startLoop();
+          this.broadcastLobby();
+          this.schedulePersist(true);
+        }
+        break;
       case "pause":
       case "resume":
         // Online menus are local overlays. The authoritative match never pauses.
         break;
       case "restart":
-        if (id === 0) {
+        if (owner) {
           this.engine.restartRun();
           this.startLoop();
         }
         break;
       case "lobby":
-        if (id === 0) {
+        if (owner) {
           this.engine.returnToLobby(this.meta.difficulty, this.meta.level);
-          for (const key of Object.keys(this.meta.ready)) if (Number(key) > 0) this.meta.ready[key] = false;
+          for (const key of Object.keys(this.meta.ready)) if (Number(key) !== this.meta.ownerId) this.meta.ready[key] = false;
           this.stopLoop();
           this.broadcastLobby();
           this.schedulePersist(true);
@@ -380,7 +434,7 @@ export class GameRoom {
         this.handleChat(socket, id, payload.text);
         break;
       case "closeRoom":
-        if (id === 0) {
+        if (owner) {
           this.broadcast({ t: "roomClosed", reason: "The room owner closed the game." });
           this.stopLoop();
           for (const connectedSocket of this.ctx.getWebSockets()) {
@@ -417,9 +471,14 @@ export class GameRoom {
     if (stillConnected) return;
 
     this.engine.removePlayer(id);
-    if (id > 0) this.meta.ready[id] = false;
+    if (!this.isOwner(id, member.clientId)) this.meta.ready[id] = false;
     if (member.clientId && this.meta.slots[member.clientId]) this.meta.slots[member.clientId].lastSeen = Date.now();
-    this.broadcast({ t: "notice", tone: "error", text: id === 0 ? "ROOM OWNER DISCONNECTED" : `P${id + 1} DISCONNECTED` }, socket);
+    const ownerLeft = this.isOwner(id, member.clientId);
+    if (ownerLeft) {
+      this.meta.ownerDisconnectedAt = Date.now();
+      this.scheduleOwnerMigration();
+    }
+    this.broadcast({ t: "notice", tone: "error", text: ownerLeft ? "ROOM OWNER RECONNECTING" : `P${id + 1} DISCONNECTED` }, socket);
     this.broadcastLobby();
     this.schedulePersist(true);
     if (!this.ctx.getWebSockets().length) this.stopLoop();
@@ -442,6 +501,100 @@ export class GameRoom {
     this.meta = null;
   }
 
+  normalizeMeta() {
+    if (!this.meta) return;
+    if (!this.meta.slots || typeof this.meta.slots !== "object") this.meta.slots = {};
+    if (!this.meta.ready || typeof this.meta.ready !== "object") this.meta.ready = {};
+    if (!Number.isInteger(this.meta.ownerId)) this.meta.ownerId = this.meta.ownerClient ? 0 : -1;
+    if (!Number.isFinite(Number(this.meta.ownerDisconnectedAt))) this.meta.ownerDisconnectedAt = 0;
+    if (this.meta.ownerClient && !this.meta.slots[this.meta.ownerClient]) {
+      this.meta.slots[this.meta.ownerClient] = { id: Math.max(0, this.meta.ownerId), lastSeen: Date.now() };
+    }
+  }
+
+  isOwner(id, clientId = "") {
+    return !!this.meta && Number(id) === Number(this.meta.ownerId) && !!clientId && clientId === this.meta.ownerClient;
+  }
+
+  ownerConnected() {
+    if (!this.meta || !this.meta.ownerClient) return false;
+    return this.ctx.getWebSockets().some((socket) => {
+      const member = socket.deserializeAttachment() || {};
+      return !member.replaced && member.clientId === this.meta.ownerClient && member.id === this.meta.ownerId;
+    });
+  }
+
+  cancelOwnerMigration() {
+    if (this.ownerMigrationTimer) clearTimeout(this.ownerMigrationTimer);
+    this.ownerMigrationTimer = null;
+  }
+
+  scheduleOwnerMigration() {
+    this.cancelOwnerMigration();
+    const elapsed = Date.now() - Number(this.meta?.ownerDisconnectedAt || 0);
+    const delay = Math.max(0, OWNER_GRACE_MS - elapsed);
+    this.ownerMigrationTimer = setTimeout(() => {
+      this.ownerMigrationTimer = null;
+      this.maybeMigrateOwner(true);
+    }, delay);
+  }
+
+  maybeMigrateOwner(force = false) {
+    if (!this.meta || this.ownerConnected()) {
+      if (this.meta) this.meta.ownerDisconnectedAt = 0;
+      this.cancelOwnerMigration();
+      return false;
+    }
+    if (!this.meta.ownerDisconnectedAt) this.meta.ownerDisconnectedAt = Date.now();
+    if (!force && Date.now() - this.meta.ownerDisconnectedAt < OWNER_GRACE_MS) {
+      this.scheduleOwnerMigration();
+      return false;
+    }
+    const candidates = this.ctx.getWebSockets()
+      .map((socket) => ({ socket, member: socket.deserializeAttachment() || {} }))
+      .filter(({ member }) => Number.isInteger(member.id) && !member.replaced)
+      .sort((a, b) => a.member.id - b.member.id);
+    if (!candidates.length) return false;
+    const next = candidates[0];
+    const previousOwnerId = this.meta.ownerId;
+    this.meta.ownerClient = next.member.clientId;
+    this.meta.ownerId = next.member.id;
+    if (Number.isInteger(previousOwnerId) && previousOwnerId !== this.meta.ownerId) this.meta.ready[previousOwnerId] = false;
+    this.meta.ownerDisconnectedAt = 0;
+    this.meta.ready[next.member.id] = true;
+    for (const { socket, member } of candidates) {
+      const owner = member.clientId === this.meta.ownerClient && member.id === this.meta.ownerId;
+      socket.serializeAttachment({ ...member, owner, role: owner ? "host" : "player" });
+    }
+    this.broadcast({ t: "ownerChanged", pv: PROTOCOL_VERSION, ownerId: this.meta.ownerId, text: `P${this.meta.ownerId + 1} IS NOW ROOM OWNER` });
+    this.broadcastLobby();
+    this.schedulePersist(true);
+    return true;
+  }
+
+  allowMessage(member, type) {
+    const config = RATE_WINDOWS[type] || RATE_WINDOWS.control;
+    const key = `${member.clientId || member.id}:${type}`;
+    const now = Date.now();
+    let bucket = this.rateBuckets.get(key);
+    if (!bucket || now - bucket.startedAt >= config.windowMs) bucket = { startedAt: now, count: 0 };
+    bucket.count += 1;
+    this.rateBuckets.set(key, bucket);
+    return bucket.count <= config.limit;
+  }
+
+  allowRoomMessage(type) {
+    const base = RATE_WINDOWS[type] || RATE_WINDOWS.control;
+    const multiplier = type === "input" ? MAX_PLAYERS : type === "sync" ? 3 : MAX_PLAYERS;
+    const limit = base.limit * multiplier;
+    const now = Date.now();
+    let bucket = this.roomRateBuckets.get(type);
+    if (!bucket || now - bucket.startedAt >= base.windowMs) bucket = { startedAt: now, count: 0 };
+    bucket.count += 1;
+    this.roomRateBuckets.set(type, bucket);
+    return bucket.count <= limit;
+  }
+
   connectedPlayerIds() {
     const ids = new Set();
     for (const socket of this.ctx.getWebSockets()) {
@@ -455,13 +608,13 @@ export class GameRoom {
     const connected = new Set(this.connectedPlayerIds());
     const members = [];
     for (let id = 0; id < MAX_PLAYERS; id += 1) {
-      const reserved = id === 0 ? !!this.meta.ownerClient : Object.values(this.meta.slots).some((slot) => slot.id === id);
+      const reserved = Object.values(this.meta.slots).some((slot) => slot.id === id);
       members.push({
         id,
         connected: connected.has(id),
         reserved,
-        ready: id === 0 ? true : !!this.meta.ready[id],
-        owner: id === 0,
+        ready: id === this.meta.ownerId ? true : !!this.meta.ready[id],
+        owner: id === this.meta.ownerId,
       });
     }
     return {
@@ -469,6 +622,7 @@ export class GameRoom {
       pv: PROTOCOL_VERSION,
       level: this.meta.level,
       difficulty: this.meta.difficulty,
+      ownerId: this.meta.ownerId,
       ready: members.map((member) => [member.id, member.ready ? 1 : 0]),
       members,
     };
@@ -483,7 +637,10 @@ export class GameRoom {
       t: "welcome",
       pv: PROTOCOL_VERSION,
       id,
-      owner: id === 0,
+      owner: this.isOwner(id, (socket.deserializeAttachment() || {}).clientId),
+      ownerId: this.meta.ownerId,
+      connectionId: (socket.deserializeAttachment() || {}).connectionId || "",
+      engine: ENGINE_REVISION,
       epoch: this.engine.epoch(),
       eventSeq: 0,
       g: this.engine.fullState(),
@@ -504,9 +661,16 @@ export class GameRoom {
   }
 
   releaseClient(clientId, id) {
-    if (id > 0 && clientId && this.meta.slots[clientId]) delete this.meta.slots[clientId];
-    if (id > 0) delete this.meta.ready[id];
+    const ownerLeft = this.isOwner(id, clientId);
+    if (clientId && this.meta.slots[clientId]) delete this.meta.slots[clientId];
+    delete this.meta.ready[id];
     this.engine.removePlayer(id);
+    if (ownerLeft) {
+      this.meta.ownerClient = "";
+      this.meta.ownerId = -1;
+      this.meta.ownerDisconnectedAt = Date.now() - OWNER_GRACE_MS;
+      this.maybeMigrateOwner(true);
+    }
     this.schedulePersist(true);
   }
 
@@ -518,16 +682,23 @@ export class GameRoom {
       if (now - Number(slot.lastSeen || 0) > DISCONNECTED_SLOT_TTL_MS) {
         delete this.meta.ready[slot.id];
         delete this.meta.slots[clientId];
+        if (clientId === this.meta.ownerClient) { this.meta.ownerClient = ""; this.meta.ownerId = -1; }
       }
     }
   }
 
   onEngineEvent(kind) {
     if (!this.initialized) return;
+    if (["run", "level", "setup"].includes(kind)) this.fireEventSeq = 0;
     this.broadcastEvent(kind);
     if (["run", "level", "go"].includes(kind)) this.startLoop();
     if (["end", "setup"].includes(kind)) this.stopLoop();
     this.schedulePersist(true);
+  }
+
+  broadcastFire(row) {
+    if (!Array.isArray(row)) return;
+    this.broadcast({ t: "fire", pv: PROTOCOL_VERSION, epoch: this.engine.epoch(), seq: ++this.fireEventSeq, row });
   }
 
   broadcastEvent(kind) {
@@ -876,11 +1047,12 @@ function inputSafe(v){let x=num(v&&v.x),y=num(v&&v.y),l=hypot(x,y);if(l>1){x/=l;
   let superSlot=Math.round(num(v&&v.superSlot,-1));if(superSlot!==0&&superSlot!==1)superSlot=-1;
   return{x,y,dash:!!(v&&v.dash),super:!!(v&&v.super)&&superSlot>=0,superSlot,dashSeq:Math.max(0,Math.round(num(v&&v.dashSeq,0))),superSeq:Math.max(0,Math.round(num(v&&v.superSeq,0))),dashX,dashY}}
 
-const PROTOCOL_VERSION=9;
+const PROTOCOL_VERSION=10;
+const ENGINE_REVISION="foundry-2026-08-04-r1";
 function normalizeEpoch(value){return Math.max(1,Math.round(num(value,1)))}
 const remoteInputs=new Map();
 const pendingRemoteDashes=new Map();
-const net={role:'host',roster:new Map(),stateEpoch:1,eventSeq:0,motionSeq:0,stateSeq:0,fireSeq:0,pendingFireEvents:[]};
+const net={role:'host',roster:new Map(),stateEpoch:1,eventSeq:0,motionSeq:0,stateSeq:0,fireSeq:0};
 let selectedDifficulty='normal',selectedLevel=1,game=null,navSearchBudget=0;
 const navGridCache=new Map();
 const NAV_CELL=10,NAV_MARGIN=0,NAV_DIRS=[[1,0,1],[-1,0,1],[0,1,1],[0,-1,1],[1,1,1.414],[-1,1,1.414],[1,-1,1.414],[-1,-1,1.414]];
@@ -897,11 +1069,10 @@ function gameSound(type,source=null,options={}){
 }
 function beep(type,options={}){gameSound(type,null,options)}
 function emit(kind){if(callbacks.event)callbacks.event(kind)}
-function advanceStateEpoch(){pendingRemoteDashes.clear();net.stateEpoch=normalizeEpoch(net.stateEpoch+1);net.eventSeq=0;net.motionSeq=0;net.stateSeq=0;net.pendingFireEvents.length=0;net.fireSeq=0}
+function advanceStateEpoch(){pendingRemoteDashes.clear();net.stateEpoch=normalizeEpoch(net.stateEpoch+1);net.eventSeq=0;net.motionSeq=0;net.stateSeq=0;net.fireSeq=0}
 function remoteControl(id){let row=remoteInputs.get(id);if(!row||performance.now()-row.at>500)return inputSafe({dashSeq:row&&row.value?row.value.dashSeq:0,superSeq:row&&row.value?row.value.superSeq:0});return inputSafe(row.value)}
 function control(p){return remoteControl(p.id)}
-function neutralizeRemoteInput(id){let old=remoteInputs.get(id),dashSeq=old&&old.value?old.value.dashSeq:0,superSeq=old&&old.value?old.value.superSeq:0,seq=old?old.seq:0;remoteInputs.set(id,{value:inputSafe({dashSeq,superSeq}),seq,at:0})}
-function recentFireRows(){let now=performance.now();net.pendingFireEvents=net.pendingFireEvents.filter(item=>item&&num(item.expires,now+1)>now);return net.pendingFireEvents.map(item=>Array.isArray(item)?item:item.row).filter(Array.isArray)}
+function neutralizeRemoteInput(id){let old=remoteInputs.get(id),dashSeq=old&&old.value?old.value.dashSeq:0,superSeq=old&&old.value?old.value.superSeq:0,seq=old?old.seq:0,generation=old?old.generation:"";remoteInputs.set(id,{value:inputSafe({dashSeq,superSeq}),seq,at:0,generation})}
 
 function sanitizeSuperSlots(v){
   let source=Array.isArray(v)?v:[];
@@ -1670,10 +1841,8 @@ function addFirePatch(x,y,owner=-1,dangerous=false,radius=21,life=1.9){
   x=clamp(num(x),28,W-28);y=clamp(num(y),28,H-28);if(navPointBlocked(x,y,4))return;
   let patch={id:++net.fireSeq,x,y,r:radius,life,maxLife:life,owner,dangerous,phase:Math.random()*6.28};
   game.firePatches.push(patch);if(game.firePatches.length>90)game.firePatches.splice(0,game.firePatches.length-90);
-  if(net.role==='host'){
-    let row=[patch.id,Math.round(x*10),Math.round(y*10),Math.round(radius*10),Math.round(life*100),owner,dangerous?1:0,Math.round(patch.phase*100)];
-    net.pendingFireEvents.push({row,expires:performance.now()+850});
-    if(net.pendingFireEvents.length>180)net.pendingFireEvents.splice(0,net.pendingFireEvents.length-180);
+  if(net.role==='host'&&callbacks.fire){
+    callbacks.fire([patch.id,Math.round(x*10),Math.round(y*10),Math.round(radius*10),Math.round(life*100),owner,dangerous?1:0,Math.round(patch.phase*100)]);
   }
 }
 function spawnFireRing(x,y,count=8,radius=76,dangerous=true){
@@ -1685,7 +1854,7 @@ function updateFirePatches(dt){
     let f=game.firePatches[i];f.life-=dt;
     if(f.life<=0){game.firePatches.splice(i,1);continue}
     if(f.dangerous){
-      for(const p of game.players)if(p.alive&&hypot(p.x-f.x,p.y-f.y)<p.r+f.r*.7)environmentHitPlayer(p,f.x,f.y,24);
+      for(const p of game.players)if(p.alive&&p.connected!==false&&hypot(p.x-f.x,p.y-f.y)<p.r+f.r*.7)environmentHitPlayer(p,f.x,f.y,24);
     }else{
       for(const e of game.enemies){
         if(e.defeated||e.fireCd>0||hypot(e.x-f.x,e.y-f.y)>=e.r+f.r*.72)continue;
@@ -1756,13 +1925,13 @@ function updateHazardsForPlayer(p,dt,map){
   }
 }
 function nearestAlive(e){let best=null,bd=1e9;
-for(const p of game.players)if(p.alive){let d=hypot(p.x-e.x,p.y-e.y);
+for(const p of game.players)if(p.alive&&p.connected!==false){let d=hypot(p.x-e.x,p.y-e.y);
 if(d<bd){bd=d;
 best=p}}return best}
 function valueIndex(list,value){let i=list.indexOf(value);return i<0?0:i}
 function quantize(value,scale=10){return Math.round(num(value)*scale)}
 function publicPlayerState(p){
-  return{id:p.id,x:p.x,y:p.y,vx:p.vx,vy:p.vy,r:p.r,maxHp:5,hp:p.hp,score:p.score,alive:p.alive,connected:p.id===0?true:(net.roster.get(p.id)?.connected!==false),cd:p.cd,dt:p.dt,dx:p.dx,dy:p.dy,faceX:p.faceX,faceY:p.faceY,inv:p.inv,shield:p.shield,magnet:p.magnet,boost:p.boost,phase:p.phase,freezeAura:p.freezeAura,timeStopAura:p.timeStopAura,fireTrailCd:p.fireTrailCd,superSlots:sanitizeSuperSlots(p.superSlots),superMeter:p.superMeter,superPassive:p.superPassive,bob:p.bob,dashHit:p.dashHit,hitTime:p.hitTime,hitVX:p.hitVX,hitVY:p.hitVY,lastDashSeq:p.lastDashSeq,lastSuperSeq:p.lastSuperSeq,superBuild:sanitizeSuperBuild(p.superBuild),trail:[]};
+  return{id:p.id,x:p.x,y:p.y,vx:p.vx,vy:p.vy,r:p.r,maxHp:5,hp:p.hp,score:p.score,alive:p.alive,connected:net.roster.get(p.id)?.connected===true&&p.connected!==false,cd:p.cd,dt:p.dt,dx:p.dx,dy:p.dy,faceX:p.faceX,faceY:p.faceY,inv:p.inv,shield:p.shield,magnet:p.magnet,boost:p.boost,phase:p.phase,freezeAura:p.freezeAura,timeStopAura:p.timeStopAura,fireTrailCd:p.fireTrailCd,superSlots:sanitizeSuperSlots(p.superSlots),superMeter:p.superMeter,superPassive:p.superPassive,bob:p.bob,dashHit:p.dashHit,hitTime:p.hitTime,hitVX:p.hitVX,hitVY:p.hitVY,lastDashSeq:p.lastDashSeq,lastSuperSeq:p.lastSuperSeq,superBuild:sanitizeSuperBuild(p.superBuild),trail:[]};
 }
 function publicEnemyState(e){return{x:e.x,y:e.y,vx:e.vx,vy:e.vy,r:e.r,type:e.type,stun:e.stun,cryo:e.cryo,phase:e.phase,cooldown:e.cooldown,aiTimer:e.aiTimer,mode:e.mode,aimX:e.aimX,aimY:e.aimY,pulseRadius:e.pulseRadius,armor:e.armor,armorTimer:e.armorTimer,burn:e.burn,maxHp:e.maxHp,hp:e.hp,hitInvuln:e.hitInvuln,bossStage:e.bossStage,attackCycle:e.attackCycle,defeated:e.defeated,deathTimer:e.deathTimer,armTargetX:e.armTargetX,armTargetY:e.armTargetY,armProgress:e.armProgress,armLength:e.armLength,inkCharge:e.inkCharge}}
 function publicGameState(){
@@ -1786,30 +1955,36 @@ function completeLevel(){
   let map=levelConfig(game.level);if(map.bonus)end(true);else if(game.level<CAMPAIGN_LEVEL_COUNT)beginLevelClear(game.level+1);else end(true);
 }
 function end(won){game.over=true;game.won=!!won;game.phase='over';game.count=0;game.phaseEndsAt=0;game.paused=true;emit('end')}
-function setConnectedPlayer(id,connected=true){
+function setConnectedPlayer(id,connected=true,generation=''){
   id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let p=game.players.find(x=>x.id===id);
   net.roster.set(id,{id,connected:!!connected});
   if(!p){let s=spawnPoint(id);p=player(id,s.x,s.y,'remote',!!connected);game.players.push(p);game.players.sort((a,b)=>a.id-b.id)}
-  p.control='remote';p.connected=!!connected;if(!connected){p.vx=0;p.vy=0;p.dt=0;neutralizeRemoteInput(id)}
-  else if(!p.alive&&game.phase==='menu')resetPlayerState(p,id,'remote',0,true,0);
+  p.control='remote';p.connected=!!connected;
+  if(!connected){p.vx=0;p.vy=0;p.dt=0;neutralizeRemoteInput(id)}
+  else{
+    pendingRemoteDashes.delete(id);p.lastDashSeq=0;p.lastSuperSeq=0;
+    remoteInputs.set(id,{value:inputSafe({}),seq:0,at:0,generation:String(generation||'')});
+    if(!p.alive&&game.phase==='menu')resetPlayerState(p,id,'remote',0,true,0);
+  }
   repairGameState();return p;
 }
 function removePlayer(id){return setConnectedPlayer(id,false)}
-function setInput(id,value,seq=0){
-  advanceTimedPhase();id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let old=remoteInputs.get(id);seq=Math.max(0,Math.round(num(seq)));
-  if(old&&seq&&seq<=old.seq)return false;let safe=inputSafe(value);remoteInputs.set(id,{value:safe,seq,at:performance.now()});
+function setInput(id,value,seq=0,generation=''){
+  advanceTimedPhase();id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let old=remoteInputs.get(id);seq=Math.max(0,Math.round(num(seq)));generation=String(generation||'');
+  if(old&&old.generation!==generation){old=null;remoteInputs.set(id,{value:inputSafe({}),seq:0,at:0,generation})}
+  if(old&&seq&&seq<=old.seq)return false;let safe=inputSafe(value);remoteInputs.set(id,{value:safe,seq,at:performance.now(),generation});
   if(safe.dashSeq)acceptRemoteDash(id,safe.dashSeq,safe.dashX,safe.dashY);return true;
 }
 function startRun(difficulty='normal',level=1){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
-  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);if(!connected.includes(0))connected.unshift(0);
+  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
   game=makeGame(selectedDifficulty,selectedLevel);game.players=[];
   for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}
   game.players.sort((a,b)=>a.id-b.id);setTimedPhase('count',3);game.paused=false;game.over=false;game.won=false;emit('run');return publicGameState();
 }
 function returnToLobby(difficulty=game.difficulty,level=game.level){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
-  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);if(!connected.includes(0))connected.unshift(0);
+  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
   game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
 }
 function restartRun(){return startRun(game.difficulty,game.level)}
@@ -1832,7 +2007,7 @@ function tick(dt){
   let cfg=difficultyConfig(game.difficulty),map=levelConfig(game.level);for(const e of game.enemies)updateEnemy(e,dt,cfg,map);
   let taken=game.coins.filter(c=>c.taken).length,boss=game.enemies.find(e=>e.type==='warden');if(!game.players.some(p=>p.alive&&p.connected!==false))end(false);else if(map.bonus){if(game.time>=num(map.bonusTime,45))end(true)}else if(map.boss){if(boss&&boss.defeated&&boss.deathTimer<=0)completeLevel()}else if(taken===game.total&&game.players.some(p=>p.alive&&p.connected!==false&&hypot(p.x-game.exit.x,p.y-game.exit.y)<p.r+game.exit.r))completeLevel();game.shake=Math.max(0,game.shake-dt);
 }
-function compactMotionState(){return{t:'motion',pv:PROTOCOL_VERSION,epoch:net.stateEpoch,seq:++net.motionSeq,ts:Math.round(performance.now()),p:game.players.map(p=>[p.id,quantize(p.x),quantize(p.y),quantize(p.vx),quantize(p.vy),quantize(p.dt,100),quantize(p.dx,100),quantize(p.dy,100),quantize(p.faceX,100),quantize(p.faceY,100),quantize(p.bob,100),quantize(p.inv,100),quantize(p.dashHit,100),Math.max(0,Math.round(num(p.lastDashSeq,0))),quantize(p.hitTime,100)]),e:game.enemies.map(e=>[quantize(e.x),quantize(e.y),quantize(e.vx),quantize(e.vy),quantize(e.phase,100),valueIndex(ENEMY_MODE_KEYS,e.mode),quantize(e.aimX,100),quantize(e.aimY,100),quantize(e.pulseRadius),quantize(e.burn,100),quantize(e.stun,100),quantize(e.armProgress,100),quantize(e.armLength),quantize(e.armTargetX),quantize(e.armTargetY),quantize(e.inkCharge,100)]),a:recentFireRows()}}
+function compactMotionState(){return{t:'motion',pv:PROTOCOL_VERSION,epoch:net.stateEpoch,seq:++net.motionSeq,ts:Math.round(performance.now()),p:game.players.map(p=>[p.id,quantize(p.x),quantize(p.y),quantize(p.vx),quantize(p.vy),quantize(p.dt,100),quantize(p.dx,100),quantize(p.dy,100),quantize(p.faceX,100),quantize(p.faceY,100),quantize(p.bob,100),quantize(p.inv,100),quantize(p.dashHit,100),Math.max(0,Math.round(num(p.lastDashSeq,0))),quantize(p.hitTime,100)]),e:game.enemies.map(e=>[quantize(e.x),quantize(e.y),quantize(e.vx),quantize(e.vy),quantize(e.phase,100),valueIndex(ENEMY_MODE_KEYS,e.mode),quantize(e.aimX,100),quantize(e.aimY,100),quantize(e.pulseRadius),quantize(e.burn,100),quantize(e.stun,100),quantize(e.armProgress,100),quantize(e.armLength),quantize(e.armTargetX),quantize(e.armTargetY),quantize(e.inkCharge,100)])}}
 function fullState(){repairGameState();refreshTimedPhaseCount();return publicGameState()}
 function wake(){return advanceTimedPhase()}
 function setSettings(difficulty,level){selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);game.nextDifficulty=selectedDifficulty;game.nextLevel=selectedLevel;if(game.phase==='menu'){game.difficulty=selectedDifficulty;game.level=selectedLevel;game.startLevel=selectedLevel;game.levelName=levelConfig(selectedLevel).name;game.levelHint=levelConfig(selectedLevel).gimmick||''}return{difficulty:selectedDifficulty,level:selectedLevel}}
@@ -1844,6 +2019,6 @@ function restore(state,roster=[],savedEpoch=1){
 function epoch(){return net.stateEpoch}
 function nextStateSeq(){return++net.stateSeq}
 
-selectedDifficulty='normal';selectedLevel=1;game=makeGame(selectedDifficulty,selectedLevel);game.players[0].control='remote';net.roster.set(0,{id:0,connected:true});
+selectedDifficulty='normal';selectedLevel=1;game=makeGame(selectedDifficulty,selectedLevel);game.players=[];net.roster.clear();
 return{tick,wake,setInput,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
 }
