@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 11;
-const ENGINE_REVISION = "foundry-2026-08-04-r2";
+const PROTOCOL_VERSION = 12;
+const ENGINE_REVISION = "foundry-2026-08-04-r3";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -111,7 +111,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 7,
+        version: 8,
         engine: ENGINE_REVISION,
       });
     }
@@ -1163,7 +1163,8 @@ function createPlayerState(id,x,y,control='local',connected=true,lastDashSeq=0,l
 function resetPlayerState(p,id,control,lastDashSeq=0,connected=true,lastSuperSeq=0){
   let spawn=spawnPoint(id);return Object.assign(p,createPlayerState(id,spawn.x,spawn.y,control,connected,lastDashSeq,lastSuperSeq));
 }
-function player(id,x,y,control='local',connected=true){return createPlayerState(id,x,y,control,connected)}
+function player(id,x,y,control='local',connected=true,lastDashSeq=0,lastSuperSeq=0){return createPlayerState(id,x,y,control,connected,lastDashSeq,lastSuperSeq)}
+function currentActionCursor(id){let value=remoteInputs.get(id)?.value||{};return{dashSeq:Math.max(0,Math.round(num(value.dashSeq))),superSeq:Math.max(0,Math.round(num(value.superSeq)))}}
 function bossMaxHp(difficulty=selectedDifficulty){return difficulty==='easy'?10:difficulty==='hard'?18:14}
 function bossMetaForLevel(level=game.level){
   let map=levelConfig(normalizeLevel(level)),kind=map.bossKind||'warden';
@@ -1998,13 +1999,13 @@ function startRun(difficulty='normal',level=1){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
   let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
   game=makeGame(selectedDifficulty,selectedLevel);game.players=[];
-  for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}
+  for(const id of connected){let spawn=spawnPoint(id),cursor=currentActionCursor(id);game.players.push(player(id,spawn.x,spawn.y,'remote',true,cursor.dashSeq,cursor.superSeq))}
   game.players.sort((a,b)=>a.id-b.id);setTimedPhase('count',3);game.paused=false;game.over=false;game.won=false;emit('run');return publicGameState();
 }
 function returnToLobby(difficulty=game.difficulty,level=game.level){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
   let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
-  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
+  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let spawn=spawnPoint(id),cursor=currentActionCursor(id);game.players.push(player(id,spawn.x,spawn.y,'remote',true,cursor.dashSeq,cursor.superSeq))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
 }
 function restartRun(){return startRun(game.difficulty,game.level)}
 function tick(dt){
@@ -2015,7 +2016,7 @@ function tick(dt){
   for(const p of game.players){
     p.bob+=dt*7;p.inv=Math.max(0,p.inv-dt);p.magnet=Math.max(0,p.magnet-dt);p.boost=Math.max(0,p.boost-dt);p.phase=Math.max(0,p.phase-dt);p.freezeAura=Math.max(0,num(p.freezeAura)-dt);p.timeStopAura=Math.max(0,num(p.timeStopAura)-dt);p.fireTrailCd=Math.max(0,num(p.fireTrailCd)-dt);p.hitTime=Math.max(0,num(p.hitTime)-dt);if(!p.hitTime){p.hitVX=0;p.hitVY=0}p.superSlots=sanitizeSuperSlots(p.superSlots);for(const slot of p.superSlots)slot.cooldown=Math.max(0,slot.cooldown-dt);p.cd=Math.max(0,p.cd-dt);p.dt=Math.max(0,p.dt-dt);p.trail=p.trail.filter(t=>performance.now()-t.at<(t.life||280)).slice(-16);p.dashHit=Math.max(0,p.dashHit-dt);
     if(!p.alive||p.connected===false)continue;let c=control(p),sp=playerMoveSpeed(p);if(c.x||c.y||p.dt>0){p.superPassive+=dt;if(p.superPassive>=2){let ticks=Math.floor(p.superPassive/2);p.superPassive-=ticks*2;gainSuperEnergy(p,ticks,'survival')}}if(c.x||c.y){p.faceX=c.x;p.faceY=c.y}
-    if(c.dashSeq>p.lastDashSeq)acceptRemoteDash(p.id,c.dashSeq,c.dashX,c.dashY);processRemoteDash(p);if(c.superSeq&&c.superSeq!==p.lastSuperSeq){p.lastSuperSeq=c.superSeq;activateSuper(p,c.superSlot)}
+    if(c.dashSeq>p.lastDashSeq)acceptRemoteDash(p.id,c.dashSeq,c.dashX,c.dashY);processRemoteDash(p);if(c.superSeq>p.lastSuperSeq){p.lastSuperSeq=c.superSeq;if(c.superSlot===0||c.superSlot===1)activateSuper(p,c.superSlot)}
     let recoiling=p.hitTime>0&&p.dt<=0;if(p.dt>0){let dashSpeed=playerDashSpeed(p);p.vx=p.dx*dashSpeed;p.vy=p.dy*dashSpeed;let trailNow=performance.now();if(trailNow-num(p._lastTrailAt,0)>=28){p._lastTrailAt=trailNow;p.trail.push({x:p.x,y:p.y,dx:p.dx,dy:p.dy,at:trailNow,life:280,flame:p.boost>0})}}else{let controlScale=recoiling?.22:1;p.vx=c.x*sp*controlScale+(recoiling?num(p.hitVX):0);p.vy=c.y*sp*controlScale+(recoiling?num(p.hitVY):0)}
     p.x+=p.vx*dt;p.y+=p.vy*dt;let wallContact=collideWorld(p);p._wallContact=wallContact;if(recoiling){let decay=Math.exp(-dt*10.5);p.hitVX*=decay;p.hitVY*=decay;if(wallContact){p.hitVX*=.18;p.hitVY*=.18}}
     if(p.boost>0&&hypot(p.vx,p.vy)>45&&p.fireTrailCd<=0){let l=hypot(p.vx,p.vy)||1,ux=p.vx/l,uy=p.vy/l;addFirePatch(p.x-ux*(p.r+8),p.y-uy*(p.r+8),p.id,false,p.dt>0?24:19,p.dt>0?2.15:1.65);p.fireTrailCd=p.dt>0?.07:.12}
@@ -2026,7 +2027,7 @@ function tick(dt){
   let cfg=difficultyConfig(game.difficulty),map=levelConfig(game.level);for(const e of game.enemies)updateEnemy(e,dt,cfg,map);
   let taken=game.coins.filter(c=>c.taken).length,boss=game.enemies.find(e=>e.type==='warden');if(!game.players.some(p=>p.alive&&p.connected!==false))end(false);else if(map.bonus){if(game.time>=num(map.bonusTime,45))end(true)}else if(map.boss){if(boss&&boss.defeated&&boss.deathTimer<=0)completeLevel()}else if(taken===game.total&&game.players.some(p=>p.alive&&p.connected!==false&&hypot(p.x-game.exit.x,p.y-game.exit.y)<p.r+game.exit.r))completeLevel();game.shake=Math.max(0,game.shake-dt);
 }
-function compactMotionState(){return{t:'motion',pv:PROTOCOL_VERSION,epoch:net.stateEpoch,seq:++net.motionSeq,ts:Math.round(performance.now()),p:game.players.map(p=>[p.id,quantize(p.x),quantize(p.y),quantize(p.vx),quantize(p.vy),quantize(p.dt,100),quantize(p.dx,100),quantize(p.dy,100),quantize(p.faceX,100),quantize(p.faceY,100),quantize(p.bob,100),quantize(p.inv,100),quantize(p.dashHit,100),Math.max(0,Math.round(num(p.lastDashSeq,0))),quantize(p.hitTime,100)]),e:game.enemies.map(e=>[quantize(e.x),quantize(e.y),quantize(e.vx),quantize(e.vy),quantize(e.phase,100),valueIndex(ENEMY_MODE_KEYS,e.mode),quantize(e.aimX,100),quantize(e.aimY,100),quantize(e.pulseRadius),quantize(e.burn,100),quantize(e.stun,100),quantize(e.armProgress,100),quantize(e.armLength),quantize(e.armTargetX),quantize(e.armTargetY),quantize(e.inkCharge,100)])}}
+function compactMotionState(){return{t:'motion',pv:PROTOCOL_VERSION,epoch:net.stateEpoch,seq:++net.motionSeq,ts:Math.round(performance.now()),p:game.players.map(p=>[p.id,quantize(p.x),quantize(p.y),quantize(p.vx),quantize(p.vy),quantize(p.dt,100),quantize(p.dx,100),quantize(p.dy,100),quantize(p.faceX,100),quantize(p.faceY,100),quantize(p.bob,100),quantize(p.inv,100),quantize(p.dashHit,100),Math.max(0,Math.round(num(p.lastDashSeq,0))),quantize(p.hitTime,100)]),e:game.enemies.map(e=>[quantize(e.x),quantize(e.y),quantize(e.vx),quantize(e.vy),quantize(e.phase,100),valueIndex(ENEMY_MODE_KEYS,e.mode),quantize(e.aimX,100),quantize(e.aimY,100),quantize(e.pulseRadius),quantize(e.burn,100),quantize(e.stun,100),quantize(e.armProgress,100),quantize(e.armLength),quantize(e.armTargetX),quantize(e.armTargetY),quantize(e.inkCharge,100)]),c:game.coins.map(c=>[quantize(c.x),quantize(c.y),c.taken?1:0])}}
 function fullState(){repairGameState();refreshTimedPhaseCount();return publicGameState()}
 function wake(){return advanceTimedPhase()}
 function setSettings(difficulty,level){selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);game.nextDifficulty=selectedDifficulty;game.nextLevel=selectedLevel;if(game.phase==='menu'){game.difficulty=selectedDifficulty;game.level=selectedLevel;game.startLevel=selectedLevel;game.levelName=levelConfig(selectedLevel).name;game.levelHint=levelConfig(selectedLevel).gimmick||''}return{difficulty:selectedDifficulty,level:selectedLevel}}

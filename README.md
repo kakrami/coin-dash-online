@@ -1,13 +1,13 @@
-# Coin Dash Online — Authoritative Server v2.0.4
+# Coin Dash Online — Authoritative Server v2.0.5
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.5. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.6. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.4.5
-- Server: v2.0.4
-- Multiplayer protocol: 11
-- Engine revision: `foundry-2026-08-04-r2`
+- Client: Coin Dash v1.4.6
+- Server: v2.0.5
+- Multiplayer protocol: 12
+- Engine revision: `foundry-2026-08-04-r3`
 
 The client and server must be deployed together.
 
@@ -23,9 +23,9 @@ Expected health response:
   "ok": true,
   "service": "coin-dash-online",
   "mode": "authoritative",
-  "protocol": 11,
-  "version": 7,
-  "engine": "foundry-2026-08-04-r2"
+  "protocol": 12,
+  "version": 8,
+  "engine": "foundry-2026-08-04-r3"
 }
 ```
 
@@ -47,25 +47,17 @@ Keep an existing `package-lock.json` if the repository already has one.
 1. Upload the five files above to the root of the existing `coin-dash-online` GitHub repository.
 2. Commit directly to the production branch already connected to Cloudflare.
 3. Wait for the Cloudflare build to show Success.
-4. Open the health-check address and confirm protocol 11, version 7, and the matching engine revision before uploading the client.
+4. Open the health-check address and confirm protocol 12, version 8, and the matching engine revision before uploading the client.
 
-## v2.0.4 fixes
+## v2.0.5 fixes
 
-- Recovery synchronization now uses a dedicated `syncState` packet and never impersonates a new connection handshake.
-- Added input-cursor recovery so a stale packet counter cannot silently freeze player movement.
-- Initial and reconnected clients receive the authoritative input cursor for their current connection.
-- The client waits for a validated server welcome before considering a join successful.
-- Lobby setup now has one difficulty editor inside Setup instead of duplicate controls.
-- Input packet, dash, and special-power sequences reset safely for each WebSocket connection generation, so a reloaded player can move immediately.
-- Added authoritative `startLevel` support for Change Level, Play Again, Next Bonus, and result-screen level selection.
-- Added room-owner migration after a short reconnect grace period.
-- Owner readiness checks follow the current owner instead of assuming Player 1 is always the owner.
-- Disconnected players are excluded from enemy targeting, hazards, completion checks, and public connected state.
-- Fire patches are sent once as sequenced reliable events instead of being repeated in every motion packet.
-- Full correction snapshots were reduced to 4 Hz while compact motion remains 30 Hz.
-- Added per-socket and per-room limits for input, sync, chat, ping, and control messages.
-- Removed obsolete host-era readiness and fire-delivery assumptions.
-- Client and server verify the same engine revision before a session is accepted.
+- New runs now inherit each connected player's current dash and power action cursors.
+- A carried action counter can no longer trigger a power automatically when a match or level begins.
+- Invalid or neutral power slots are consumed safely instead of defaulting to the first power.
+- Power events are processed monotonically and only explicit slot 0 or slot 1 events can activate a power.
+- Coin positions and collected state are now included in the 30 Hz compact motion stream.
+- Magnetized coins, bonus rings, moving lanes, and figure-eight bonus coins no longer depend on the 4 Hz full correction snapshot for visual movement.
+- Full authoritative correction snapshots remain at 4 Hz while player, enemy, and coin motion remains at 30 Hz.
 
 ## Architecture
 
