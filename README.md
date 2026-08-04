@@ -1,10 +1,10 @@
-# Coin Dash Online — Authoritative Server v2.0.1
+# Coin Dash Online — Authoritative Server v2.0.2
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.2. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.3. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.4.2
+- Client: Coin Dash v1.4.3
 - Server: v2.0.1
 - Multiplayer protocol: 9
 
@@ -23,7 +23,7 @@ Expected health response:
   "service": "coin-dash-online",
   "mode": "authoritative",
   "protocol": 9,
-  "version": 4
+  "version": 5
 }
 ```
 
@@ -47,14 +47,13 @@ Keep an existing `package-lock.json` if the repository already has one.
 3. Wait for the Cloudflare build to show Success.
 4. Open the health-check address and confirm protocol 9 before uploading the matching client.
 
-## v2.0.1 fixes
+## v2.0.2 fixes
 
-- Replaced frame-dependent level changes with absolute timed phases.
-- Added an explicit level-clear phase before loading the next level.
-- Repaired countdown and level-intro recovery after a Durable Object wakes.
-- Advances expired transitions whenever any player input, ping, or sync message arrives.
-- Removed stale peer-host dash-sequence references from level resets.
-- Preserves authoritative player slots, inputs, dash sequences, and special sequences between levels.
+- Online menus and chat are local overlays and never pause the authoritative match.
+- Older clients that still send pause or resume messages cannot pause the room.
+- Lobby level and difficulty edits preserve connected players’ Ready status.
+- Removed the redundant full-state setup event for ordinary lobby setting changes.
+- Restored active persisted matches as unpaused after a Worker wake.
 
 ## Architecture
 

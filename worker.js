@@ -102,7 +102,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 4,
+        version: 5,
       });
     }
 
@@ -338,9 +338,7 @@ export class GameRoom {
           const settings = this.engine.setSettings(payload.difficulty, payload.level);
           this.meta.difficulty = settings.difficulty;
           this.meta.level = settings.level;
-          for (const key of Object.keys(this.meta.ready)) if (Number(key) > 0) this.meta.ready[key] = false;
           this.broadcastLobby();
-          this.broadcastEvent("setup");
           this.schedulePersist();
         }
         break;
@@ -357,13 +355,8 @@ export class GameRoom {
         }
         break;
       case "pause":
-        if (id === 0) this.engine.pauseRun();
-        break;
       case "resume":
-        if (id === 0) {
-          this.engine.resumeRun();
-          this.startLoop();
-        }
+        // Online menus are local overlays. The authoritative match never pauses.
         break;
       case "restart":
         if (id === 0) {
@@ -532,8 +525,8 @@ export class GameRoom {
   onEngineEvent(kind) {
     if (!this.initialized) return;
     this.broadcastEvent(kind);
-    if (["run", "resume", "level", "go"].includes(kind)) this.startLoop();
-    if (["pause", "end", "setup"].includes(kind)) this.stopLoop();
+    if (["run", "level", "go"].includes(kind)) this.startLoop();
+    if (["end", "setup"].includes(kind)) this.stopLoop();
     this.schedulePersist(true);
   }
 
@@ -1820,9 +1813,6 @@ function returnToLobby(difficulty=game.difficulty,level=game.level){
   game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
 }
 function restartRun(){return startRun(game.difficulty,game.level)}
-function pauseRun(){if(game.phase!=='menu'&&!game.over){game.paused=true;emit('pause')}}
-function resumeRun(){if(game.phase!=='menu'&&!game.over){game.paused=false;emit('resume')}}
-
 function tick(dt){
   dt=clamp(num(dt),0,.05);if(!game||game.over)return;
   if(game.phase==='menu'||game.paused)return;
@@ -1849,11 +1839,11 @@ function setSettings(difficulty,level){selectedDifficulty=normalizeDifficulty(di
 function restore(state,roster=[],savedEpoch=1){
   if(state&&typeof state==='object'){game=typeof structuredClone==='function'?structuredClone(state):JSON.parse(JSON.stringify(state));repairGameState();selectedDifficulty=normalizeDifficulty(game.nextDifficulty||game.difficulty);selectedLevel=normalizeLevel(game.nextLevel||game.level)}
   net.roster.clear();for(const row of roster||[]){let id=clamp(Math.round(num(row&&row.id)),0,ROOM_JOINERS),connected=!!(row&&row.connected);net.roster.set(id,{id,connected});let p=game.players.find(x=>x.id===id);if(p){p.control='remote';p.connected=connected}}
-  if(['count','level','clear'].includes(game.phase)&&!game.phaseEndsAt)game.phaseEndsAt=Date.now()+Math.max(0,num(game.count))*1000;net.stateEpoch=normalizeEpoch(savedEpoch);net.eventSeq=0;net.motionSeq=0;net.stateSeq=0;advanceTimedPhase();return fullState();
+  if(game.phase!=='menu'&&!game.over)game.paused=false;if(['count','level','clear'].includes(game.phase)&&!game.phaseEndsAt)game.phaseEndsAt=Date.now()+Math.max(0,num(game.count))*1000;net.stateEpoch=normalizeEpoch(savedEpoch);net.eventSeq=0;net.motionSeq=0;net.stateSeq=0;advanceTimedPhase();return fullState();
 }
 function epoch(){return net.stateEpoch}
 function nextStateSeq(){return++net.stateSeq}
 
 selectedDifficulty='normal';selectedLevel=1;game=makeGame(selectedDifficulty,selectedLevel);game.players[0].control='remote';net.roster.set(0,{id:0,connected:true});
-return{tick,wake,setInput,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,pauseRun,resumeRun,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
+return{tick,wake,setInput,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
 }
