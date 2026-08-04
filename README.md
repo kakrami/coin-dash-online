@@ -1,13 +1,13 @@
-# Coin Dash Online — Authoritative Server v2.0.5
+# Coin Dash Online — Authoritative Server v2.0.6
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.6. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.8. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.4.6
-- Server: v2.0.5
-- Multiplayer protocol: 12
-- Engine revision: `foundry-2026-08-04-r3`
+- Client: Coin Dash v1.4.8
+- Server: v2.0.6
+- Multiplayer protocol: 13
+- Engine revision: `foundry-2026-08-04-r4`
 
 The client and server must be deployed together.
 
@@ -23,9 +23,9 @@ Expected health response:
   "ok": true,
   "service": "coin-dash-online",
   "mode": "authoritative",
-  "protocol": 12,
-  "version": 8,
-  "engine": "foundry-2026-08-04-r3"
+  "protocol": 13,
+  "version": 9,
+  "engine": "foundry-2026-08-04-r4"
 }
 ```
 
@@ -47,9 +47,13 @@ Keep an existing `package-lock.json` if the repository already has one.
 1. Upload the five files above to the root of the existing `coin-dash-online` GitHub repository.
 2. Commit directly to the production branch already connected to Cloudflare.
 3. Wait for the Cloudflare build to show Success.
-4. Open the health-check address and confirm protocol 12, version 8, and the matching engine revision before uploading the client.
+4. Open the health-check address and confirm protocol 13, version 9, and the matching engine revision before uploading the client.
 
-## v2.0.5 fixes
+## v2.0.6 fixes
+
+- Room creation now atomically reserves player slot 1 for the owner before the room code is returned.
+- Fast joiners can no longer claim the owner slot while the owner WebSocket is still connecting.
+- Host identity is validated against the reservation created by `POST /rooms`.
 
 - New runs now inherit each connected player's current dash and power action cursors.
 - A carried action counter can no longer trigger a power automatically when a match or level begins.

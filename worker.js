@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 12;
-const ENGINE_REVISION = "foundry-2026-08-04-r3";
+const PROTOCOL_VERSION = 13;
+const ENGINE_REVISION = "foundry-2026-08-04-r4";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -111,17 +111,21 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 8,
+        version: 9,
         engine: ENGINE_REVISION,
       });
     }
 
     if (url.pathname === "/rooms" && request.method === "POST") {
+      let body = null;
+      try { body = await request.json(); } catch {}
+      const ownerClient = safeClientId(body && body.client);
+      if (!ownerClient) return json(request, env, { error: "Missing owner client ID." }, 400);
       for (let attempt = 0; attempt < 8; attempt += 1) {
         const code = makeRoomCode();
         const id = env.ROOMS.idFromName(code);
         const room = env.ROOMS.get(id);
-        const created = await room.fetch("https://room.internal/create", { method: "POST" });
+        const created = await room.fetch(`https://room.internal/create?client=${encodeURIComponent(ownerClient)}`, { method: "POST" });
         if (created.status === 201) {
           return json(request, env, { code, protocol: PROTOCOL_VERSION, mode: "authoritative" }, 201);
         }
@@ -205,16 +209,18 @@ export class GameRoom {
 
     if (url.pathname === "/create" && request.method === "POST") {
       if (this.meta) return json(request, this.env, { error: "Room already exists." }, 409);
+      const ownerClient = safeClientId(url.searchParams.get("client"));
+      if (!ownerClient) return json(request, this.env, { error: "Missing owner client ID." }, 400);
       const now = Date.now();
       this.meta = {
         createdAt: now,
-        ownerClient: "",
-        ownerId: -1,
-        ownerDisconnectedAt: 0,
+        ownerClient,
+        ownerId: 0,
+        ownerDisconnectedAt: now,
         level: 1,
         difficulty: "normal",
         ready: { 0: true },
-        slots: {},
+        slots: { [ownerClient]: { id: 0, lastSeen: now } },
       };
       await this.persist(true);
       await this.ctx.storage.setAlarm(now + ROOM_LIFETIME_MS);
@@ -238,14 +244,7 @@ export class GameRoom {
     if (existing && Number.isInteger(existing.id)) {
       id = existing.id;
     } else if (requestedRole === "host") {
-      if (this.meta.ownerClient && this.meta.ownerClient !== clientId) {
-        return json(request, this.env, { error: "Room already has an owner." }, 409);
-      }
-      id = 0;
-      this.meta.ownerClient = clientId;
-      this.meta.ownerId = id;
-      this.meta.ownerDisconnectedAt = 0;
-      this.meta.slots[clientId] = { id, lastSeen: Date.now() };
+      return json(request, this.env, { error: "Owner reservation does not match." }, 409);
     } else {
       const used = new Set(Object.values(this.meta.slots).map((slot) => slot.id));
       for (let candidate = 0; candidate < MAX_PLAYERS; candidate += 1) {
