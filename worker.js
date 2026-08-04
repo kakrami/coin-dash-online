@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 13;
-const ENGINE_REVISION = "foundry-2026-08-04-r4";
+const PROTOCOL_VERSION = 14;
+const ENGINE_REVISION = "foundry-2026-08-04-r5";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -111,7 +111,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 9,
+        version: 10,
         engine: ENGINE_REVISION,
       });
     }
@@ -833,7 +833,7 @@ const POWER_DEFS={
   repair:{label:'Nanite Bloom',short:'Repair',color:'#61ff88',shape:'cross'}
 };
 const NOVA_RADIUS=300;
-const STARTING_SUPER_TYPES=['timestop','phase'];
+const STARTING_SUPER_TYPES=['phase'];
 const SUPER_DEFS={
   nova:{label:'Blast Hammer',color:'#ff5a1f',cooldown:14,style:'combat',radius:NOVA_RADIUS,tool:'hammer'},
   phase:{label:'Star Surge',color:'#ffd84d',cooldown:18,style:'survival',tool:'star'},
@@ -1060,7 +1060,7 @@ function num(v,d=0){v=Number(v);return Number.isFinite(v)?v:d}
 function inputSafe(v){let x=num(v&&v.x),y=num(v&&v.y),l=hypot(x,y);if(l>1){x/=l;y/=l}
   let dashX=num(v&&v.dashX,x),dashY=num(v&&v.dashY,y),dl=hypot(dashX,dashY);
   if(dl>.001){dashX/=dl;dashY/=dl}else{dashX=x;dashY=y}
-  let superSlot=Math.round(num(v&&v.superSlot,-1));if(superSlot!==0&&superSlot!==1)superSlot=-1;
+  let superSlot=Math.round(num(v&&v.superSlot,-1));if(superSlot!==0)superSlot=-1;
   return{x,y,dash:!!(v&&v.dash),super:!!(v&&v.super)&&superSlot>=0,superSlot,dashSeq:Math.max(0,Math.round(num(v&&v.dashSeq,0))),superSeq:Math.max(0,Math.round(num(v&&v.superSeq,0))),dashX,dashY}}
 
 function normalizeEpoch(value){return Math.max(1,Math.round(num(value,1)))}
@@ -1071,7 +1071,9 @@ let selectedDifficulty='normal',selectedLevel=1,game=null,navSearchBudget=0;
 const navGridCache=new Map();
 const NAV_CELL=10,NAV_MARGIN=0,NAV_DIRS=[[1,0,1],[-1,0,1],[0,1,1],[0,-1,1],[1,1,1.414],[-1,1,1.414],[1,-1,1.414],[-1,-1,1.414]];
 const NAV_SEARCHES_PER_TICK=2;
-const POWER_PICKUP_RADIUS=30,POWER_PICKUP_Y_OFFSET=12;
+const POWER_PICKUP_RADIUS=30,POWER_PICKUP_Y_OFFSET=12,POWER_RESPAWN_MIN=8,POWER_RESPAWN_MAX=14;
+const POWER_TYPE_KEYS=Object.keys(POWER_DEFS);
+function randomPowerType(previous=''){let choices=POWER_TYPE_KEYS.filter(type=>type!==previous);return choices[Math.floor(Math.random()*choices.length)]||POWER_TYPE_KEYS[0]}
 const ENEMY_TYPE_KEYS=['hunter','scout','charger','sentinel','brute','warden'];
 const ENEMY_MODE_KEYS=['chase','windup','charge','orbit','dart','return','beamWindup','beam','slamWindup','slam','bossChase','bossChargeWindup','bossCharge','bossSlamWindup','bossSlam','bossRingWindup','bossArmWindup','bossArmStrike','bossInkWindup','bossInkBurst','bossRecover','bossDefeated'];
 const SUPER_TYPE_KEYS=['','nova','phase','timestop'];
@@ -1119,7 +1121,7 @@ function repairGameState(target=game){
   if(!Array.isArray(target.inkSplats))target.inkSplats=[];
   target.inkSplats=target.inkSplats.filter(s=>s&&isGoodNum(s.x)&&isGoodNum(s.y)&&num(s.life)>0).map(s=>({id:Math.max(0,Math.round(num(s.id))),x:clamp(num(s.x),-80,W+80),y:clamp(num(s.y),-80,H+80),r:clamp(num(s.r,54),24,110),life:clamp(num(s.life),0,6),maxLife:clamp(num(s.maxLife,s.life),.5,6),phase:num(s.phase),tone:clamp(Math.round(num(s.tone)),0,2)})).slice(-12);
   if(!Array.isArray(target.powerups))target.powerups=[];
-  target.powerups=target.powerups.filter(x=>x&&POWER_DEFS[x.type]&&isGoodNum(x.x)&&isGoodNum(x.y)).map(x=>({...x,r:clamp(num(x.r,12),7,18),taken:!!x.taken,pulse:num(x.pulse)}));
+  target.powerups=target.powerups.filter(x=>x&&POWER_DEFS[x.type]&&isGoodNum(x.x)&&isGoodNum(x.y)).map(x=>({...x,r:clamp(num(x.r,12),7,18),taken:!!x.taken,pulse:num(x.pulse),respawnAt:Math.max(0,num(x.respawnAt))}));
   if(!Array.isArray(target.enemies))target.enemies=[];
   for(const e of target.enemies){
     e.type=ENEMY_DEFS[e.type]?e.type:'hunter';let def=ENEMY_DEFS[e.type];
@@ -1172,7 +1174,7 @@ function bossMetaForLevel(level=game.level){
 }
 function enemy(x,y,startSpeed=70,type='hunter',difficulty=selectedDifficulty){let a=Math.random()*6.28,def=ENEMY_DEFS[type]||ENEMY_DEFS.hunter,mode=type==='scout'?'orbit':type==='sentinel'?'return':type==='warden'?'bossChase':'chase',maxHp=type==='warden'?bossMaxHp(normalizeDifficulty(difficulty)):1;
 return{x,y,homeX:x,homeY:y,vx:type==='warden'?0:Math.cos(a)*startSpeed,vy:type==='warden'?0:Math.sin(a)*startSpeed,r:def.radius,type:ENEMY_DEFS[type]?type:'hunter',stun:0,cryo:0,phase:Math.random()*6.28,cooldown:type==='warden'?1.8:1.2+Math.random()*1.8,aiTimer:0,mode,aimX:1,aimY:0,pulseRadius:0,attackHits:[],armor:type==='brute'?1:0,armorTimer:0,scoreCd:0,burn:0,fireCd:0,navPath:[],navIndex:0,navTimer:0,navTargetX:x,navTargetY:y,navProgressX:x,navProgressY:y,navStuck:0,maxHp,hp:maxHp,hitInvuln:0,bossStage:1,attackCycle:0,defeated:false,deathTimer:0,bossTrailCd:0,armTargetX:x,armTargetY:y,armProgress:0,armLength:0,inkCharge:0}}
-function powerup(type,x,y,i=0){return{type,x,y,r:13,taken:false,pulse:i*.7}}
+function powerup(type,x,y,i=0){return{type,x,y,r:13,taken:false,pulse:i*.7,respawnAt:0}}
 function playerTouchesPower(p,item){let dx=p.x-item.x,dy=p.y-(item.y-POWER_PICKUP_Y_OFFSET),reach=p.r+POWER_PICKUP_RADIUS;return dx*dx+dy*dy<=reach*reach}
 function levelPowerSpecs(level){return(levelConfig(level).powers||[]).map(p=>[p[0],p[1],p[2]])}
 function makeBonusCoins(map){
@@ -1327,8 +1329,8 @@ function applyPower(p,type){
 function activateSuper(p,slotIndex=0){
   if(!p||!p.alive)return false;
   p.superSlots=sanitizeSuperSlots(p.superSlots);
-  slotIndex=slotIndex===1?1:0;
-  let slot=p.superSlots[slotIndex],def=SUPER_DEFS[slot.type];
+  if(slotIndex!==0)return false;
+  let slot=p.superSlots[0],def=SUPER_DEFS[slot.type];
   if(!def||slot.cooldown>0)return false;
   let type=slot.type;
   slot.cooldown=def.cooldown;
@@ -1361,7 +1363,8 @@ function activateSuper(p,slotIndex=0){
   return true;
 }
 function collectCoin(p,coin){if(coin.taken)return;coin.taken=true;let value=Math.max(1,Math.round(num(coin.value,1)));p.score+=value;if(isBonusLevel())coin.respawnAt=game.time+num(levelConfig(game.level).bonusRespawn,.85)*(coin.jackpot?2.2:1);gainSuperEnergy(p,Math.min(12,6*value),'collect');gameSound('coin',coin);if(coin.jackpot)beep('superReady',{bus:'game',gain:.38})}
-function collectPower(p,item){if(item.taken)return;item.taken=true;applyPower(p,item.type);gainSuperEnergy(p,12,'survival')}
+function updatePowerRespawns(){for(const item of game.powerups||[]){if(!item.taken||!item.respawnAt||game.time<item.respawnAt)continue;item.type=randomPowerType(item.type);item.taken=false;item.respawnAt=0;item.pulse+=.7+Math.random()*.8}}
+function collectPower(p,item){if(item.taken)return;item.taken=true;item.respawnAt=game.time+POWER_RESPAWN_MIN+Math.random()*(POWER_RESPAWN_MAX-POWER_RESPAWN_MIN);applyPower(p,item.type);gainSuperEnergy(p,12,'survival')}
 function dashSmash(p,e){
   p.dashHit=Math.max(p.dashHit,DASH_ENEMY_GRACE+.04);
   if(e.type==='warden'){let hit=damageBoss(e,p,1,p.dx,p.dy);if(hit){if(!e.defeated)beginBossRecovery(e,e.bossStage,.1);e.vx=p.dx*58;e.vy=p.dy*58;p.trail.push({x:e.x,y:e.y,dx:p.dx,dy:p.dy,at:performance.now(),life:420,hit:true});}return}
@@ -2011,11 +2014,11 @@ function tick(dt){
   dt=clamp(num(dt),0,.05);if(!game||game.over)return;
   if(game.phase==='menu'||game.paused)return;
   if(['count','level','clear'].includes(game.phase)){advanceTimedPhase();return}
-  game.time+=dt;game.hazardTime+=game.timeStop>0?0:dt;updateBonusCoinField();navSearchBudget=NAV_SEARCHES_PER_TICK;
+  game.time+=dt;game.hazardTime+=game.timeStop>0?0:dt;updateBonusCoinField();updatePowerRespawns();navSearchBudget=NAV_SEARCHES_PER_TICK;
   for(const p of game.players){
     p.bob+=dt*7;p.inv=Math.max(0,p.inv-dt);p.magnet=Math.max(0,p.magnet-dt);p.boost=Math.max(0,p.boost-dt);p.phase=Math.max(0,p.phase-dt);p.freezeAura=Math.max(0,num(p.freezeAura)-dt);p.timeStopAura=Math.max(0,num(p.timeStopAura)-dt);p.fireTrailCd=Math.max(0,num(p.fireTrailCd)-dt);p.hitTime=Math.max(0,num(p.hitTime)-dt);if(!p.hitTime){p.hitVX=0;p.hitVY=0}p.superSlots=sanitizeSuperSlots(p.superSlots);for(const slot of p.superSlots)slot.cooldown=Math.max(0,slot.cooldown-dt);p.cd=Math.max(0,p.cd-dt);p.dt=Math.max(0,p.dt-dt);p.trail=p.trail.filter(t=>performance.now()-t.at<(t.life||280)).slice(-16);p.dashHit=Math.max(0,p.dashHit-dt);
     if(!p.alive||p.connected===false)continue;let c=control(p),sp=playerMoveSpeed(p);if(c.x||c.y||p.dt>0){p.superPassive+=dt;if(p.superPassive>=2){let ticks=Math.floor(p.superPassive/2);p.superPassive-=ticks*2;gainSuperEnergy(p,ticks,'survival')}}if(c.x||c.y){p.faceX=c.x;p.faceY=c.y}
-    if(c.dashSeq>p.lastDashSeq)acceptRemoteDash(p.id,c.dashSeq,c.dashX,c.dashY);processRemoteDash(p);if(c.superSeq>p.lastSuperSeq){p.lastSuperSeq=c.superSeq;if(c.superSlot===0||c.superSlot===1)activateSuper(p,c.superSlot)}
+    if(c.dashSeq>p.lastDashSeq)acceptRemoteDash(p.id,c.dashSeq,c.dashX,c.dashY);processRemoteDash(p);if(c.superSeq>p.lastSuperSeq){p.lastSuperSeq=c.superSeq;if(c.superSlot===0)activateSuper(p,0)}
     let recoiling=p.hitTime>0&&p.dt<=0;if(p.dt>0){let dashSpeed=playerDashSpeed(p);p.vx=p.dx*dashSpeed;p.vy=p.dy*dashSpeed;let trailNow=performance.now();if(trailNow-num(p._lastTrailAt,0)>=28){p._lastTrailAt=trailNow;p.trail.push({x:p.x,y:p.y,dx:p.dx,dy:p.dy,at:trailNow,life:280,flame:p.boost>0})}}else{let controlScale=recoiling?.22:1;p.vx=c.x*sp*controlScale+(recoiling?num(p.hitVX):0);p.vy=c.y*sp*controlScale+(recoiling?num(p.hitVY):0)}
     p.x+=p.vx*dt;p.y+=p.vy*dt;let wallContact=collideWorld(p);p._wallContact=wallContact;if(recoiling){let decay=Math.exp(-dt*10.5);p.hitVX*=decay;p.hitVY*=decay;if(wallContact){p.hitVX*=.18;p.hitVY*=.18}}
     if(p.boost>0&&hypot(p.vx,p.vy)>45&&p.fireTrailCd<=0){let l=hypot(p.vx,p.vy)||1,ux=p.vx/l,uy=p.vy/l;addFirePatch(p.x-ux*(p.r+8),p.y-uy*(p.r+8),p.id,false,p.dt>0?24:19,p.dt>0?2.15:1.65);p.fireTrailCd=p.dt>0?.07:.12}

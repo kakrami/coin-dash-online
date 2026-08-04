@@ -1,13 +1,13 @@
-# Coin Dash Online — Authoritative Server v2.0.6
+# Coin Dash Online — Authoritative Server v2.0.7
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.8. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.9. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.4.8
-- Server: v2.0.6
-- Multiplayer protocol: 13
-- Engine revision: `foundry-2026-08-04-r4`
+- Client: Coin Dash v1.4.9
+- Server: v2.0.7
+- Multiplayer protocol: 14
+- Engine revision: `foundry-2026-08-04-r5`
 
 The client and server must be deployed together.
 
@@ -23,9 +23,9 @@ Expected health response:
   "ok": true,
   "service": "coin-dash-online",
   "mode": "authoritative",
-  "protocol": 13,
-  "version": 9,
-  "engine": "foundry-2026-08-04-r4"
+  "protocol": 14,
+  "version": 10,
+  "engine": "foundry-2026-08-04-r5"
 }
 ```
 
@@ -47,21 +47,18 @@ Keep an existing `package-lock.json` if the repository already has one.
 1. Upload the five files above to the root of the existing `coin-dash-online` GitHub repository.
 2. Commit directly to the production branch already connected to Cloudflare.
 3. Wait for the Cloudflare build to show Success.
-4. Open the health-check address and confirm protocol 13, version 9, and the matching engine revision before uploading the client.
+4. Open the health-check address and confirm protocol 14, version 10, and the matching engine revision before uploading the client.
 
-## v2.0.6 fixes
+## v2.0.7 changes
 
-- Room creation now atomically reserves player slot 1 for the owner before the room code is returned.
-- Fast joiners can no longer claim the owner slot while the owner WebSocket is still connecting.
-- Host identity is validated against the reservation created by `POST /rooms`.
-
-- New runs now inherit each connected player's current dash and power action cursors.
-- A carried action counter can no longer trigger a power automatically when a match or level begins.
-- Invalid or neutral power slots are consumed safely instead of defaulting to the first power.
-- Power events are processed monotonically and only explicit slot 0 or slot 1 events can activate a power.
-- Coin positions and collected state are now included in the 30 Hz compact motion stream.
-- Magnetized coins, bonus rings, moving lanes, and figure-eight bonus coins no longer depend on the 4 Hz full correction snapshot for visual movement.
-- Full authoritative correction snapshots remain at 4 Hz while player, enemy, and coin motion remains at 30 Hz.
+- Multiplayer protocol 14 matches Coin Dash client v1.4.9.
+- Players now start with only Star Surge, the six-second invincibility power.
+- The former default Cryo Freeze slot is no longer assigned or accepted as a player super.
+- Power pickups respawn after a randomized 8–14 second delay.
+- Each respawn rerolls to a different pickup type from the one collected.
+- Respawn timing and pickup type remain authoritative for every connected player.
+- All 15 stages, including the three bonus rounds, use the same level sequence and selector.
+- Dash collision feedback remains separate from real damage state, so dash impacts do not create damage blinking.
 
 ## Architecture
 
