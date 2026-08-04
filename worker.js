@@ -5,7 +5,7 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 8;
+const PROTOCOL_VERSION = 9;
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 10;
@@ -102,7 +102,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 3,
+        version: 4,
       });
     }
 
@@ -141,6 +141,7 @@ export class GameRoom {
     });
     this.chat = [];
     this.loopTimer = null;
+    this.loopRunning = false;
     this.loopGeneration = 0;
     this.lastTickAt = 0;
     this.accumulator = 0;
@@ -308,6 +309,8 @@ export class GameRoom {
     const member = socket.deserializeAttachment() || {};
     const id = Number.isInteger(member.id) ? member.id : -1;
     if (id < 0) return;
+
+    this.engine.wake();
 
     if (payload.t === "ping") {
       this.send(socket, { t: "pong", at: Number(payload.at) || Date.now(), serverAt: Date.now() });
@@ -546,12 +549,13 @@ export class GameRoom {
   }
 
   startLoop() {
-    if (this.loopTimer || this.engine.game.phase === "menu" || this.engine.game.over || this.engine.game.paused) return;
+    if (this.loopRunning || this.engine.game.phase === "menu" || this.engine.game.over || this.engine.game.paused) return;
+    this.loopRunning = true;
     const generation = ++this.loopGeneration;
     this.lastTickAt = performance.now();
     this.accumulator = 0;
     const pump = () => {
-      if (generation !== this.loopGeneration) return;
+      if (!this.loopRunning || generation !== this.loopGeneration) return;
       const now = performance.now();
       let elapsed = Math.max(0, Math.min(250, now - this.lastTickAt));
       this.lastTickAt = now;
@@ -577,9 +581,7 @@ export class GameRoom {
           g: this.engine.fullState(),
         });
       }
-      if (now - this.lastPersistAt >= PERSIST_INTERVAL_MS) {
-        this.schedulePersist();
-      }
+      if (now - this.lastPersistAt >= PERSIST_INTERVAL_MS) this.schedulePersist();
 
       if (this.engine.game.phase === "menu" || this.engine.game.over || this.engine.game.paused || !this.ctx.getWebSockets().length) {
         this.stopLoop();
@@ -591,6 +593,7 @@ export class GameRoom {
   }
 
   stopLoop() {
+    this.loopRunning = false;
     this.loopGeneration += 1;
     if (this.loopTimer) clearTimeout(this.loopTimer);
     this.loopTimer = null;
@@ -880,7 +883,7 @@ function inputSafe(v){let x=num(v&&v.x),y=num(v&&v.y),l=hypot(x,y);if(l>1){x/=l;
   let superSlot=Math.round(num(v&&v.superSlot,-1));if(superSlot!==0&&superSlot!==1)superSlot=-1;
   return{x,y,dash:!!(v&&v.dash),super:!!(v&&v.super)&&superSlot>=0,superSlot,dashSeq:Math.max(0,Math.round(num(v&&v.dashSeq,0))),superSeq:Math.max(0,Math.round(num(v&&v.superSeq,0))),dashX,dashY}}
 
-const PROTOCOL_VERSION=8;
+const PROTOCOL_VERSION=9;
 function normalizeEpoch(value){return Math.max(1,Math.round(num(value,1)))}
 const remoteInputs=new Map();
 const pendingRemoteDashes=new Map();
@@ -931,7 +934,7 @@ function repairGameState(target=game){
   target.levelName=levelConfig(target.level).name;target.levelHint=levelConfig(target.level).gimmick||'';
   target.timeStop=clamp(num(target.timeStop),0,8);
   target.inkSeq=Math.max(0,Math.round(num(target.inkSeq)));
-  target.hazardTime=Math.max(0,num(target.hazardTime,target.time));
+  target.hazardTime=Math.max(0,num(target.hazardTime,target.time));target.phaseEndsAt=Math.max(0,num(target.phaseEndsAt));
   if(target.superFx&&typeof target.superFx==='object'){target.superFx={type:SUPER_DEFS[target.superFx.type]?target.superFx.type:'nova',x:num(target.superFx.x,W/2),y:num(target.superFx.y,H/2),time:clamp(num(target.superFx.time),0,2)}}else target.superFx=null;
   if(!Array.isArray(target.firePatches))target.firePatches=[];
   target.firePatches=target.firePatches.filter(f=>f&&isGoodNum(f.x)&&isGoodNum(f.y)&&num(f.life)>0).map(f=>({id:Math.max(0,Math.round(num(f.id))),x:clamp(num(f.x),24,W-24),y:clamp(num(f.y),24,H-24),r:clamp(num(f.r,20),8,40),life:clamp(num(f.life),0,4),maxLife:clamp(num(f.maxLife,f.life),.2,4),owner:Math.round(num(f.owner,-1)),dangerous:!!f.dangerous,phase:num(f.phase)})).slice(-90);
@@ -1037,11 +1040,12 @@ function makeLevelObjects(level,difficulty){
 }
 function makeGame(difficulty=selectedDifficulty,startLevel=selectedLevel){
   difficulty=normalizeDifficulty(difficulty);let level=normalizeLevel(startLevel),parts=makeLevelObjects(level,difficulty),s=spawnPoint(0);
-  return{players:[player(0,s.x,s.y,'local',true)],coins:parts.coins,enemies:parts.enemies,powerups:parts.powerups,firePatches:[],inkSplats:[],inkSeq:0,difficulty,nextDifficulty:difficulty,level,startLevel:level,nextLevel:level,maxLevel:LEVELS.length,levelName:levelConfig(level).name,levelHint:levelConfig(level).gimmick||'',phase:'menu',count:0,time:0,hazardTime:0,over:false,won:false,paused:false,exit:parts.exit,shake:0,timeStop:0,superFx:null,total:parts.coins.length};
+  return{players:[player(0,s.x,s.y,'local',true)],coins:parts.coins,enemies:parts.enemies,powerups:parts.powerups,firePatches:[],inkSplats:[],inkSeq:0,difficulty,nextDifficulty:difficulty,level,startLevel:level,nextLevel:level,maxLevel:LEVELS.length,levelName:levelConfig(level).name,levelHint:levelConfig(level).gimmick||'',phase:'menu',count:0,phaseEndsAt:0,time:0,hazardTime:0,over:false,won:false,paused:false,exit:parts.exit,shake:0,timeStop:0,superFx:null,total:parts.coins.length};
 }
 function resetPlayersForLevel(){
   for(const p of game.players){
-    let score=p.score,id=p.id,control=p.control,connected=p.connected!==false,lastDash=id?remoteDashSeq(id):0,lastSuper=id?remoteSuperSeq(id):0;
+    let score=p.score,id=p.id,control=p.control,connected=p.connected!==false,input=id?remoteInputs.get(id)?.value:null;
+    let lastDash=Math.max(0,Math.round(num(input?.dashSeq))),lastSuper=Math.max(0,Math.round(num(input?.superSeq)));
     let superSlots=sanitizeSuperSlots(p.superSlots),superMeter=clamp(num(p.superMeter),0,100),superBuild=sanitizeSuperBuild(p.superBuild),superPassive=clamp(num(p.superPassive),0,3);
     resetPlayerState(p,id,control,lastDash,connected,lastSuper);p.score=score;
     p.superSlots=superSlots;p.superMeter=superMeter;p.superBuild=superBuild;p.superPassive=superPassive;
@@ -1769,19 +1773,26 @@ function publicPlayerState(p){
 }
 function publicEnemyState(e){return{x:e.x,y:e.y,vx:e.vx,vy:e.vy,r:e.r,type:e.type,stun:e.stun,cryo:e.cryo,phase:e.phase,cooldown:e.cooldown,aiTimer:e.aiTimer,mode:e.mode,aimX:e.aimX,aimY:e.aimY,pulseRadius:e.pulseRadius,armor:e.armor,armorTimer:e.armorTimer,burn:e.burn,maxHp:e.maxHp,hp:e.hp,hitInvuln:e.hitInvuln,bossStage:e.bossStage,attackCycle:e.attackCycle,defeated:e.defeated,deathTimer:e.deathTimer,armTargetX:e.armTargetX,armTargetY:e.armTargetY,armProgress:e.armProgress,armLength:e.armLength,inkCharge:e.inkCharge}}
 function publicGameState(){
-  return{difficulty:game.difficulty,nextDifficulty:game.nextDifficulty,level:game.level,startLevel:game.startLevel,nextLevel:game.nextLevel,maxLevel:game.maxLevel,levelName:game.levelName,levelHint:game.levelHint,phase:game.phase,count:game.count,time:game.time,hazardTime:game.hazardTime,over:game.over,won:game.won,paused:game.paused,exit:{...game.exit},shake:game.shake,timeStop:game.timeStop,superFx:game.superFx?{...game.superFx}:null,total:game.total,players:game.players.map(publicPlayerState),enemies:game.enemies.map(publicEnemyState),coins:game.coins.map(c=>({...c})),powerups:game.powerups.map(x=>({...x})),firePatches:(game.firePatches||[]).map(f=>({...f})),inkSplats:(game.inkSplats||[]).map(s=>({...s})),inkSeq:Math.max(0,Math.round(num(game.inkSeq)))};
+  return{difficulty:game.difficulty,nextDifficulty:game.nextDifficulty,level:game.level,startLevel:game.startLevel,nextLevel:game.nextLevel,maxLevel:game.maxLevel,levelName:game.levelName,levelHint:game.levelHint,phase:game.phase,count:game.count,phaseEndsAt:game.phaseEndsAt,time:game.time,hazardTime:game.hazardTime,over:game.over,won:game.won,paused:game.paused,exit:{...game.exit},shake:game.shake,timeStop:game.timeStop,superFx:game.superFx?{...game.superFx}:null,total:game.total,players:game.players.map(publicPlayerState),enemies:game.enemies.map(publicEnemyState),coins:game.coins.map(c=>({...c})),powerups:game.powerups.map(x=>({...x})),firePatches:(game.firePatches||[]).map(f=>({...f})),inkSplats:(game.inkSplats||[]).map(s=>({...s})),inkSeq:Math.max(0,Math.round(num(game.inkSeq)))};
 }
 
+function setTimedPhase(phase,seconds){game.phase=phase;game.count=Math.max(0,num(seconds));game.phaseEndsAt=Date.now()+Math.round(game.count*1000)}
+function refreshTimedPhaseCount(){if(['count','level','clear'].includes(game.phase)&&game.phaseEndsAt>0)game.count=Math.max(0,(game.phaseEndsAt-Date.now())/1000)}
+function advanceTimedPhase(){
+  if(!['count','level','clear'].includes(game.phase))return false;refreshTimedPhaseCount();if(game.count>0)return false;
+  game.count=0;game.phaseEndsAt=0;if(game.phase==='clear'){loadLevel(game.nextLevel);return true}game.phase='play';emit('go');return true
+}
 function loadLevel(level){
   level=normalizeLevel(level);advanceStateEpoch();let parts=makeLevelObjects(level,game.difficulty);
-  game.level=level;game.maxLevel=LEVELS.length;game.levelName=levelConfig(level).name;game.levelHint=levelConfig(level).gimmick||'';game.coins=parts.coins;game.enemies=parts.enemies;game.powerups=parts.powerups;game.firePatches=[];game.inkSplats=[];game.inkSeq=0;game.exit=parts.exit;game.total=parts.coins.length;game.phase='level';game.count=2.4;game.paused=false;game.over=false;game.won=false;game.shake=0;game.timeStop=0;game.superFx=null;game.time=0;game.hazardTime=0;
+  game.level=level;game.nextLevel=level;game.maxLevel=LEVELS.length;game.levelName=levelConfig(level).name;game.levelHint=levelConfig(level).gimmick||'';game.coins=parts.coins;game.enemies=parts.enemies;game.powerups=parts.powerups;game.firePatches=[];game.inkSplats=[];game.inkSeq=0;game.exit=parts.exit;game.total=parts.coins.length;setTimedPhase('level',2.4);game.paused=false;game.over=false;game.won=false;game.shake=0;game.timeStop=0;game.superFx=null;game.time=0;game.hazardTime=0;
   resetPlayersForLevel();for(const id of remoteInputs.keys())neutralizeRemoteInput(id);emit('level');
 }
+function beginLevelClear(nextLevel){game.nextLevel=normalizeLevel(nextLevel);setTimedPhase('clear',1.05);game.paused=false;for(const p of game.players){p.vx=0;p.vy=0;p.dt=0}for(const id of remoteInputs.keys())neutralizeRemoteInput(id);emit('clear')}
 function completeLevel(){
   for(const p of game.players)if(p.connected!==false)gainSuperEnergy(p,24,'survival');
-  let map=levelConfig(game.level);if(map.bonus)end(true);else if(game.level<CAMPAIGN_LEVEL_COUNT)loadLevel(game.level+1);else end(true);
+  let map=levelConfig(game.level);if(map.bonus)end(true);else if(game.level<CAMPAIGN_LEVEL_COUNT)beginLevelClear(game.level+1);else end(true);
 }
-function end(won){game.over=true;game.won=!!won;game.phase='over';game.paused=true;emit('end')}
+function end(won){game.over=true;game.won=!!won;game.phase='over';game.count=0;game.phaseEndsAt=0;game.paused=true;emit('end')}
 function setConnectedPlayer(id,connected=true){
   id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let p=game.players.find(x=>x.id===id);
   net.roster.set(id,{id,connected:!!connected});
@@ -1792,7 +1803,7 @@ function setConnectedPlayer(id,connected=true){
 }
 function removePlayer(id){return setConnectedPlayer(id,false)}
 function setInput(id,value,seq=0){
-  id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let old=remoteInputs.get(id);seq=Math.max(0,Math.round(num(seq)));
+  advanceTimedPhase();id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let old=remoteInputs.get(id);seq=Math.max(0,Math.round(num(seq)));
   if(old&&seq&&seq<=old.seq)return false;let safe=inputSafe(value);remoteInputs.set(id,{value:safe,seq,at:performance.now()});
   if(safe.dashSeq)acceptRemoteDash(id,safe.dashSeq,safe.dashX,safe.dashY);return true;
 }
@@ -1801,12 +1812,12 @@ function startRun(difficulty='normal',level=1){
   let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);if(!connected.includes(0))connected.unshift(0);
   game=makeGame(selectedDifficulty,selectedLevel);game.players=[];
   for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}
-  game.players.sort((a,b)=>a.id-b.id);game.phase='count';game.count=3;game.paused=false;game.over=false;game.won=false;emit('run');return publicGameState();
+  game.players.sort((a,b)=>a.id-b.id);setTimedPhase('count',3);game.paused=false;game.over=false;game.won=false;emit('run');return publicGameState();
 }
 function returnToLobby(difficulty=game.difficulty,level=game.level){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
   let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);if(!connected.includes(0))connected.unshift(0);
-  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';emit('setup');return publicGameState();
+  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let s=spawnPoint(id);game.players.push(player(id,s.x,s.y,'remote',true))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
 }
 function restartRun(){return startRun(game.difficulty,game.level)}
 function pauseRun(){if(game.phase!=='menu'&&!game.over){game.paused=true;emit('pause')}}
@@ -1815,7 +1826,7 @@ function resumeRun(){if(game.phase!=='menu'&&!game.over){game.paused=false;emit(
 function tick(dt){
   dt=clamp(num(dt),0,.05);if(!game||game.over)return;
   if(game.phase==='menu'||game.paused)return;
-  if(game.phase==='count'||game.phase==='level'){game.count=Math.max(0,game.count-dt);if(!game.count){game.phase='play';emit('go')}return}
+  if(['count','level','clear'].includes(game.phase)){advanceTimedPhase();return}
   game.time+=dt;game.hazardTime+=game.timeStop>0?0:dt;updateBonusCoinField();navSearchBudget=NAV_SEARCHES_PER_TICK;
   for(const p of game.players){
     p.bob+=dt*7;p.inv=Math.max(0,p.inv-dt);p.magnet=Math.max(0,p.magnet-dt);p.boost=Math.max(0,p.boost-dt);p.phase=Math.max(0,p.phase-dt);p.freezeAura=Math.max(0,num(p.freezeAura)-dt);p.timeStopAura=Math.max(0,num(p.timeStopAura)-dt);p.fireTrailCd=Math.max(0,num(p.fireTrailCd)-dt);p.hitTime=Math.max(0,num(p.hitTime)-dt);if(!p.hitTime){p.hitVX=0;p.hitVY=0}p.superSlots=sanitizeSuperSlots(p.superSlots);for(const slot of p.superSlots)slot.cooldown=Math.max(0,slot.cooldown-dt);p.cd=Math.max(0,p.cd-dt);p.dt=Math.max(0,p.dt-dt);p.trail=p.trail.filter(t=>performance.now()-t.at<(t.life||280)).slice(-16);p.dashHit=Math.max(0,p.dashHit-dt);
@@ -1832,16 +1843,17 @@ function tick(dt){
   let taken=game.coins.filter(c=>c.taken).length,boss=game.enemies.find(e=>e.type==='warden');if(!game.players.some(p=>p.alive&&p.connected!==false))end(false);else if(map.bonus){if(game.time>=num(map.bonusTime,45))end(true)}else if(map.boss){if(boss&&boss.defeated&&boss.deathTimer<=0)completeLevel()}else if(taken===game.total&&game.players.some(p=>p.alive&&p.connected!==false&&hypot(p.x-game.exit.x,p.y-game.exit.y)<p.r+game.exit.r))completeLevel();game.shake=Math.max(0,game.shake-dt);
 }
 function compactMotionState(){return{t:'motion',pv:PROTOCOL_VERSION,epoch:net.stateEpoch,seq:++net.motionSeq,ts:Math.round(performance.now()),p:game.players.map(p=>[p.id,quantize(p.x),quantize(p.y),quantize(p.vx),quantize(p.vy),quantize(p.dt,100),quantize(p.dx,100),quantize(p.dy,100),quantize(p.faceX,100),quantize(p.faceY,100),quantize(p.bob,100),quantize(p.inv,100),quantize(p.dashHit,100),Math.max(0,Math.round(num(p.lastDashSeq,0))),quantize(p.hitTime,100)]),e:game.enemies.map(e=>[quantize(e.x),quantize(e.y),quantize(e.vx),quantize(e.vy),quantize(e.phase,100),valueIndex(ENEMY_MODE_KEYS,e.mode),quantize(e.aimX,100),quantize(e.aimY,100),quantize(e.pulseRadius),quantize(e.burn,100),quantize(e.stun,100),quantize(e.armProgress,100),quantize(e.armLength),quantize(e.armTargetX),quantize(e.armTargetY),quantize(e.inkCharge,100)]),a:recentFireRows()}}
-function fullState(){repairGameState();return publicGameState()}
+function fullState(){repairGameState();refreshTimedPhaseCount();return publicGameState()}
+function wake(){return advanceTimedPhase()}
 function setSettings(difficulty,level){selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);game.nextDifficulty=selectedDifficulty;game.nextLevel=selectedLevel;if(game.phase==='menu'){game.difficulty=selectedDifficulty;game.level=selectedLevel;game.startLevel=selectedLevel;game.levelName=levelConfig(selectedLevel).name;game.levelHint=levelConfig(selectedLevel).gimmick||''}return{difficulty:selectedDifficulty,level:selectedLevel}}
 function restore(state,roster=[],savedEpoch=1){
   if(state&&typeof state==='object'){game=typeof structuredClone==='function'?structuredClone(state):JSON.parse(JSON.stringify(state));repairGameState();selectedDifficulty=normalizeDifficulty(game.nextDifficulty||game.difficulty);selectedLevel=normalizeLevel(game.nextLevel||game.level)}
   net.roster.clear();for(const row of roster||[]){let id=clamp(Math.round(num(row&&row.id)),0,ROOM_JOINERS),connected=!!(row&&row.connected);net.roster.set(id,{id,connected});let p=game.players.find(x=>x.id===id);if(p){p.control='remote';p.connected=connected}}
-  net.stateEpoch=normalizeEpoch(savedEpoch);net.eventSeq=0;net.motionSeq=0;net.stateSeq=0;return fullState();
+  if(['count','level','clear'].includes(game.phase)&&!game.phaseEndsAt)game.phaseEndsAt=Date.now()+Math.max(0,num(game.count))*1000;net.stateEpoch=normalizeEpoch(savedEpoch);net.eventSeq=0;net.motionSeq=0;net.stateSeq=0;advanceTimedPhase();return fullState();
 }
 function epoch(){return net.stateEpoch}
 function nextStateSeq(){return++net.stateSeq}
 
 selectedDifficulty='normal';selectedLevel=1;game=makeGame(selectedDifficulty,selectedLevel);game.players[0].control='remote';net.roster.set(0,{id:0,connected:true});
-return{tick,setInput,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,pauseRun,resumeRun,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
+return{tick,wake,setInput,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,pauseRun,resumeRun,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
 }
