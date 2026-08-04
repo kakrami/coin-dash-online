@@ -1,13 +1,13 @@
-# Coin Dash Online — Authoritative Server v2.0.3
+# Coin Dash Online — Authoritative Server v2.0.4
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.4. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.4.5. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.4.4
-- Server: v2.0.3
-- Multiplayer protocol: 10
-- Engine revision: `foundry-2026-08-04-r1`
+- Client: Coin Dash v1.4.5
+- Server: v2.0.4
+- Multiplayer protocol: 11
+- Engine revision: `foundry-2026-08-04-r2`
 
 The client and server must be deployed together.
 
@@ -23,9 +23,9 @@ Expected health response:
   "ok": true,
   "service": "coin-dash-online",
   "mode": "authoritative",
-  "protocol": 10,
-  "version": 6,
-  "engine": "foundry-2026-08-04-r1"
+  "protocol": 11,
+  "version": 7,
+  "engine": "foundry-2026-08-04-r2"
 }
 ```
 
@@ -47,10 +47,15 @@ Keep an existing `package-lock.json` if the repository already has one.
 1. Upload the five files above to the root of the existing `coin-dash-online` GitHub repository.
 2. Commit directly to the production branch already connected to Cloudflare.
 3. Wait for the Cloudflare build to show Success.
-4. Open the health-check address and confirm protocol 10, version 6, and the matching engine revision before uploading the client.
+4. Open the health-check address and confirm protocol 11, version 7, and the matching engine revision before uploading the client.
 
-## v2.0.3 fixes
+## v2.0.4 fixes
 
+- Recovery synchronization now uses a dedicated `syncState` packet and never impersonates a new connection handshake.
+- Added input-cursor recovery so a stale packet counter cannot silently freeze player movement.
+- Initial and reconnected clients receive the authoritative input cursor for their current connection.
+- The client waits for a validated server welcome before considering a join successful.
+- Lobby setup now has one difficulty editor inside Setup instead of duplicate controls.
 - Input packet, dash, and special-power sequences reset safely for each WebSocket connection generation, so a reloaded player can move immediately.
 - Added authoritative `startLevel` support for Change Level, Play Again, Next Bonus, and result-screen level selection.
 - Added room-owner migration after a short reconnect grace period.

@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 10;
-const ENGINE_REVISION = "foundry-2026-08-04-r1";
+const PROTOCOL_VERSION = 11;
+const ENGINE_REVISION = "foundry-2026-08-04-r2";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -111,7 +111,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 6,
+        version: 7,
         engine: ENGINE_REVISION,
       });
     }
@@ -291,20 +291,7 @@ export class GameRoom {
     } else if (this.meta.ready[id] !== true) this.meta.ready[id] = false;
     if (this.meta.slots[clientId]) this.meta.slots[clientId].lastSeen = Date.now();
 
-    this.send(server, {
-      t: "welcome",
-      pv: PROTOCOL_VERSION,
-      id,
-      owner: this.isOwner(id, clientId),
-      ownerId: this.meta.ownerId,
-      connectionId,
-      engine: ENGINE_REVISION,
-      epoch: this.engine.epoch(),
-      eventSeq: 0,
-      g: this.engine.fullState(),
-      lobby: this.lobbyPacket(),
-      chat: this.chat,
-    });
+    this.sendWelcomeState(server, id);
     this.broadcast({
       t: "notice",
       tone: "success",
@@ -366,9 +353,21 @@ export class GameRoom {
     }
 
     switch (payload.t) {
-      case "input":
-        this.engine.setInput(id, payload.v, payload.seq, member.connectionId);
+      case "input": {
+        const accepted = this.engine.setInput(id, payload.v, payload.seq, member.connectionId);
+        if (!accepted) {
+          const cursor = this.engine.inputCursor(id);
+          this.send(socket, {
+            t: "inputCursor",
+            pv: PROTOCOL_VERSION,
+            connectionId: member.connectionId || "",
+            seq: cursor.seq,
+            dashSeq: cursor.dashSeq,
+            superSeq: cursor.superSeq,
+          });
+        }
         break;
+      }
       case "ready":
         if (!owner && this.engine.game.phase === "menu") {
           this.meta.ready[id] = !!payload.ready;
@@ -428,7 +427,7 @@ export class GameRoom {
         }
         break;
       case "sync":
-        this.sendWelcomeState(socket, id);
+        this.sendSyncState(socket, id);
         break;
       case "chat":
         this.handleChat(socket, id, payload.text);
@@ -633,19 +632,37 @@ export class GameRoom {
   }
 
   sendWelcomeState(socket, id) {
+    const member = socket.deserializeAttachment() || {};
     this.send(socket, {
       t: "welcome",
       pv: PROTOCOL_VERSION,
       id,
-      owner: this.isOwner(id, (socket.deserializeAttachment() || {}).clientId),
+      owner: this.isOwner(id, member.clientId),
       ownerId: this.meta.ownerId,
-      connectionId: (socket.deserializeAttachment() || {}).connectionId || "",
+      connectionId: member.connectionId || "",
       engine: ENGINE_REVISION,
       epoch: this.engine.epoch(),
       eventSeq: 0,
+      input: this.engine.inputCursor(id),
       g: this.engine.fullState(),
       lobby: this.lobbyPacket(),
       chat: this.chat,
+    });
+  }
+
+  sendSyncState(socket, id) {
+    const member = socket.deserializeAttachment() || {};
+    this.send(socket, {
+      t: "syncState",
+      pv: PROTOCOL_VERSION,
+      id,
+      ownerId: this.meta.ownerId,
+      connectionId: member.connectionId || "",
+      engine: ENGINE_REVISION,
+      epoch: this.engine.epoch(),
+      input: this.engine.inputCursor(id),
+      g: this.engine.fullState(),
+      lobby: this.lobbyPacket(),
     });
   }
 
@@ -1047,8 +1064,6 @@ function inputSafe(v){let x=num(v&&v.x),y=num(v&&v.y),l=hypot(x,y);if(l>1){x/=l;
   let superSlot=Math.round(num(v&&v.superSlot,-1));if(superSlot!==0&&superSlot!==1)superSlot=-1;
   return{x,y,dash:!!(v&&v.dash),super:!!(v&&v.super)&&superSlot>=0,superSlot,dashSeq:Math.max(0,Math.round(num(v&&v.dashSeq,0))),superSeq:Math.max(0,Math.round(num(v&&v.superSeq,0))),dashX,dashY}}
 
-const PROTOCOL_VERSION=10;
-const ENGINE_REVISION="foundry-2026-08-04-r1";
 function normalizeEpoch(value){return Math.max(1,Math.round(num(value,1)))}
 const remoteInputs=new Map();
 const pendingRemoteDashes=new Map();
@@ -1975,6 +1990,10 @@ function setInput(id,value,seq=0,generation=''){
   if(old&&seq&&seq<=old.seq)return false;let safe=inputSafe(value);remoteInputs.set(id,{value:safe,seq,at:performance.now(),generation});
   if(safe.dashSeq)acceptRemoteDash(id,safe.dashSeq,safe.dashX,safe.dashY);return true;
 }
+function inputCursor(id){
+  id=clamp(Math.round(num(id)),0,ROOM_JOINERS);let row=remoteInputs.get(id),value=row&&row.value||{};
+  return{seq:Math.max(0,Math.round(num(row&&row.seq))),dashSeq:Math.max(0,Math.round(num(value.dashSeq))),superSeq:Math.max(0,Math.round(num(value.superSeq)))};
+}
 function startRun(difficulty='normal',level=1){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
   let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
@@ -2020,5 +2039,5 @@ function epoch(){return net.stateEpoch}
 function nextStateSeq(){return++net.stateSeq}
 
 selectedDifficulty='normal';selectedLevel=1;game=makeGame(selectedDifficulty,selectedLevel);game.players=[];net.roster.clear();
-return{tick,wake,setInput,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
+return{tick,wake,setInput,inputCursor,setConnectedPlayer,removePlayer,startRun,restartRun,returnToLobby,setSettings,restore,fullState,compactMotionState,epoch,nextStateSeq,get game(){return game},get protocol(){return PROTOCOL_VERSION}};
 }
