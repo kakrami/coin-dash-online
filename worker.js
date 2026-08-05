@@ -13,10 +13,10 @@ const STATE_INTERVAL_MS = 1000 / 4;
 const PERSIST_INTERVAL_MS = 10_000;
 const MAX_CATCHUP_STEPS = 6;
 const OWNER_GRACE_MS = 60_000;
-const CLIENT_ACTIVITY_TTL_MS = 45_000;
 const EMPTY_ROOM_GRACE_MS = 2 * 60 * 1000;
-const DIRECTORY_REFRESH_MS = 30_000;
-const DIRECTORY_STALE_MS = 75_000;
+const ROOM_IDLE_CLOSE_MS = 30 * 60 * 1000;
+const DIRECTORY_REFRESH_MS = 25_000;
+const DIRECTORY_STALE_MS = 2 * 60 * 1000;
 const RATE_WINDOWS = {
   input: { limit: 50, windowMs: 1000 },
   ping: { limit: 6, windowMs: 3000 },
@@ -115,16 +115,25 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 17,
+        version: 18,
         engine: ENGINE_REVISION,
       });
     }
 
     if (url.pathname === "/rooms" && request.method === "GET") {
-      const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("global"));
-      const listed = await directory.fetch("https://directory.internal/list");
-      const data = await listed.json();
-      return json(request, env, data, listed.status);
+      try {
+        const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("global"));
+        const listed = await directory.fetch("https://directory.internal/list");
+        const data = await listed.json();
+        return json(request, env, data, listed.status);
+      } catch {
+        return json(request, env, {
+          rooms: [],
+          protocol: PROTOCOL_VERSION,
+          updatedAt: Date.now(),
+          temporary: true,
+        });
+      }
     }
 
     if (url.pathname === "/rooms" && request.method === "POST") {
@@ -312,6 +321,7 @@ export class GameRoom {
         ownerId: 0,
         ownerDisconnectedAt: now,
         emptySince: now,
+        lastRoomActivityAt: now,
         level: 1,
         difficulty: "normal",
         ready: { 0: true },
@@ -391,6 +401,7 @@ export class GameRoom {
 
     this.engine.setConnectedPlayer(id, true, connectionId, !reconnecting);
     this.meta.emptySince = 0;
+    this.meta.lastRoomActivityAt = Date.now();
     if (this.isOwner(id, clientId)) {
       this.meta.ready[id] = true;
       this.meta.ownerDisconnectedAt = 0;
@@ -443,6 +454,7 @@ export class GameRoom {
     const activityAt = Date.now();
     socket.serializeAttachment({ ...member, lastActivityAt: activityAt });
     if (member.clientId && this.meta.slots[member.clientId]) this.meta.slots[member.clientId].lastSeen = activityAt;
+    this.meta.lastRoomActivityAt = activityAt;
     if (this.meta.emptySince) this.meta.emptySince = 0;
     this.ctx.waitUntil(this.scheduleMaintenanceAlarm());
     if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
@@ -624,12 +636,15 @@ export class GameRoom {
     this.reapExpiredSlots();
     this.refreshEmptyState(now);
     const hardExpiresAt = Number(this.meta.createdAt || now) + ROOM_LIFETIME_MS;
+    const idleExpiresAt = Number(this.meta.lastRoomActivityAt || this.meta.createdAt || now) + ROOM_IDLE_CLOSE_MS;
     const emptyExpiresAt = this.meta.emptySince ? Number(this.meta.emptySince) + EMPTY_ROOM_GRACE_MS : Infinity;
-    if (now >= hardExpiresAt || now >= emptyExpiresAt) {
-      await this.destroyRoom(now >= hardExpiresAt ? "Room expired." : "Empty room closed.");
+    if (now >= hardExpiresAt || now >= idleExpiresAt || now >= emptyExpiresAt) {
+      const reason = now >= hardExpiresAt ? "Room expired." : now >= idleExpiresAt ? "Inactive room closed." : "Empty room closed.";
+      await this.destroyRoom(reason);
       return;
     }
-    if (this.connectedPlayerIds(now).length) {
+    if (this.connectedPlayerIds().length) {
+      if (!this.ownerConnected() && this.meta.ownerDisconnectedAt && now - Number(this.meta.ownerDisconnectedAt) >= OWNER_GRACE_MS) this.maybeMigrateOwner(true);
       await this.updateDirectory();
       if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
     } else {
@@ -648,6 +663,7 @@ export class GameRoom {
     if (!Number.isInteger(this.meta.ownerId)) this.meta.ownerId = this.meta.ownerClient ? 0 : -1;
     if (!Number.isFinite(Number(this.meta.ownerDisconnectedAt))) this.meta.ownerDisconnectedAt = 0;
     if (!Number.isFinite(Number(this.meta.emptySince))) this.meta.emptySince = 0;
+    if (!Number.isFinite(Number(this.meta.lastRoomActivityAt))) this.meta.lastRoomActivityAt = Number(this.meta.createdAt) || Date.now();
     if (this.meta.ownerClient && !this.meta.slots[this.meta.ownerClient]) {
       this.meta.slots[this.meta.ownerClient] = { id: Math.max(0, this.meta.ownerId), lastSeen: Date.now() };
     }
@@ -736,17 +752,15 @@ export class GameRoom {
     return bucket.count <= limit;
   }
 
-  memberIsActive(member, now = Date.now()) {
-    if (!member || !Number.isInteger(member.id) || member.replaced || member.released) return false;
-    const lastActivityAt = Number(member.lastActivityAt || member.connectedAt || 0);
-    return lastActivityAt > 0 && now - lastActivityAt <= CLIENT_ACTIVITY_TTL_MS;
+  memberIsActive(member) {
+    return !!member && Number.isInteger(member.id) && !member.replaced && !member.released;
   }
 
-  connectedPlayerIds(now = Date.now()) {
+  connectedPlayerIds() {
     const ids = new Set();
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = socket.deserializeAttachment() || {};
-      if (this.memberIsActive(attachment, now)) ids.add(attachment.id);
+      if (this.memberIsActive(attachment)) ids.add(attachment.id);
     }
     return [...ids].sort((a, b) => a - b);
   }
@@ -765,14 +779,14 @@ export class GameRoom {
   async scheduleMaintenanceAlarm(now = Date.now()) {
     if (!this.meta) return;
     this.refreshEmptyState(now);
-    const deadlines = [Number(this.meta.createdAt || now) + ROOM_LIFETIME_MS];
+    const connected = this.connectedPlayerIds().length > 0;
+    const deadlines = [
+      Number(this.meta.createdAt || now) + ROOM_LIFETIME_MS,
+      Number(this.meta.lastRoomActivityAt || this.meta.createdAt || now) + ROOM_IDLE_CLOSE_MS,
+    ];
     if (this.meta.emptySince) deadlines.push(Number(this.meta.emptySince) + EMPTY_ROOM_GRACE_MS);
-    for (const socket of this.ctx.getWebSockets()) {
-      const member = socket.deserializeAttachment() || {};
-      if (!member || member.replaced || member.released) continue;
-      const lastActivityAt = Number(member.lastActivityAt || member.connectedAt || 0);
-      if (lastActivityAt > 0 && lastActivityAt + CLIENT_ACTIVITY_TTL_MS > now) deadlines.push(lastActivityAt + CLIENT_ACTIVITY_TTL_MS);
-    }
+    if (connected) deadlines.push(now + DIRECTORY_REFRESH_MS);
+    if (!this.ownerConnected() && this.meta.ownerDisconnectedAt) deadlines.push(Number(this.meta.ownerDisconnectedAt) + OWNER_GRACE_MS);
     const next = Math.max(now + 1000, Math.min(...deadlines.filter(Number.isFinite)));
     await this.ctx.storage.setAlarm(next);
   }
@@ -1026,19 +1040,24 @@ export class GameRoom {
 
   async updateDirectory() {
     const entry = this.directoryEntry();
-    if (!entry || !this.env.DIRECTORY) return;
+    if (!entry || !this.env.DIRECTORY) return false;
     if (entry.players < 1) {
       await this.removeFromDirectory();
-      return;
+      return false;
     }
     const directory = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("global"));
     try {
-      await directory.fetch("https://directory.internal/update", {
+      const response = await directory.fetch("https://directory.internal/update", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(entry),
       });
-    } catch {}
+      if (!response.ok) return false;
+      this.lastDirectoryAt = Date.now();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async removeFromDirectory() {
