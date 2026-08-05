@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 19;
-const ENGINE_REVISION = "foundry-2026-08-05-r10";
+const PROTOCOL_VERSION = 20;
+const ENGINE_REVISION = "foundry-2026-08-05-r11";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -115,7 +115,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 16,
+        version: 17,
         engine: ENGINE_REVISION,
       });
     }
@@ -1418,11 +1418,38 @@ function repairGameState(target=game){
   }
 }
 function spawnPoint(id){let spots=[[92,92],[122,112],[92,148],[150,92],[150,148],[116,188]];let s=spots[id%spots.length],row=Math.floor(id/spots.length);return{x:s[0]+row*18,y:s[1]+row*14}}
+function spawnCircleTouchesRect(x,y,radius,b,pad=0){let nearestX=clamp(x,b.x-pad,b.x+b.w+pad),nearestY=clamp(y,b.y-pad,b.y+b.h+pad);return hypot(x-nearestX,y-nearestY)<radius}
+function spawnHazardBlocks(x,y,radius,h){let pad=10;
+  if(h.type==='conveyor')return spawnCircleTouchesRect(x,y,radius,h,pad);
+  if(h.type==='gravity')return hypot(x-h.x,y-h.y)<num(h.radius,130)+radius+pad;
+  if(h.type==='laser')return pointSegmentDistance(x,y,h.x1,h.y1,h.x2,h.y2)<radius+16;
+  if(h.type==='spinner')return hypot(x-h.x,y-h.y)<num(h.radius,170)+radius+16;
+  if(h.type==='pulse')return hypot(x-h.x,y-h.y)<num(h.maxRadius,180)+radius+12;
+  if(h.type==='flame'){let end=flameEnd(h);return pointSegmentDistance(x,y,h.x,h.y,end.x,end.y)<radius+num(h.width,30)*.5+12}
+  return false
+}
+function spawnPointSafe(x,y,radius,level,occupied=[]){
+  if(x<radius+30||x>W-radius-30||y<radius+30||y>H-radius-30)return false;
+  let map=levelConfig(level);
+  for(const wall of levelWalls(level))if(spawnCircleTouchesRect(x,y,radius,wall,8))return false;
+  for(const hazard of map.hazards||[])if(spawnHazardBlocks(x,y,radius,hazard))return false;
+  for(let i=0;i<(map.enemies||[]).length;i++){let pos=map.enemies[i],type=(map.enemyTypes||[])[i]||'hunter',enemyRadius=(ENEMY_DEFS[type]||ENEMY_DEFS.hunter).radius;if(hypot(x-pos[0],y-pos[1])<radius+enemyRadius+58)return false}
+  for(const other of occupied||[])if(other&&other.id!==undefined&&hypot(x-num(other.x),y-num(other.y))<radius+num(other.r,15)+12)return false;
+  return true
+}
+function resolvedSpawnPoint(id,level=game&&game.level||selectedLevel,occupied=[]){
+  level=normalizeLevel(level);let preferred=spawnPoint(id),radius=15,candidates=[preferred];
+  for(let y=54;y<=H-54;y+=26)for(let x=54;x<=W-54;x+=26)candidates.push({x,y});
+  candidates.sort((a,b)=>{let ad=(a.x-preferred.x)**2+(a.y-preferred.y)**2+Math.max(0,a.x-300)*22,bd=(b.x-preferred.x)**2+(b.y-preferred.y)**2+Math.max(0,b.x-300)*22;return ad-bd||a.y-b.y||a.x-b.x});
+  for(const candidate of candidates)if(spawnPointSafe(candidate.x,candidate.y,radius,level,occupied))return{x:candidate.x,y:candidate.y};
+  return{x:clamp(preferred.x,radius+30,W-radius-30),y:clamp(preferred.y,radius+30,H-radius-30)}
+}
+function stabilizePlayersForPlayStart(){for(const p of game.players||[]){p.vx=0;p.vy=0;p.dt=0;p.hitTime=0;p.hitVX=0;p.hitVY=0;p.dashHit=0;p.trail=[];p._wallContact=false}}
 function createPlayerState(id,x,y,control='local',connected=true,lastDashSeq=0,lastSuperSeq=0){
   return{id,x,y,vx:0,vy:0,r:15,maxHp:5,hp:5,score:0,alive:true,connected,control,cd:0,dt:0,dx:1,dy:0,faceX:1,faceY:0,inv:0,shield:0,magnet:0,boost:0,phase:0,freezeAura:0,timeStopAura:0,fireTrailCd:0,superSlots:sanitizeSuperSlots([]),superMeter:0,superBuild:sanitizeSuperBuild({}),superPassive:0,bob:Math.random()*9,trail:[],dashHit:0,hitTime:0,hitVX:0,hitVY:0,lastDashSeq:Math.max(0,Math.round(num(lastDashSeq))),lastSuperSeq:Math.max(0,Math.round(num(lastSuperSeq))),superHeld:false};
 }
-function resetPlayerState(p,id,control,lastDashSeq=0,connected=true,lastSuperSeq=0){
-  let spawn=spawnPoint(id);return Object.assign(p,createPlayerState(id,spawn.x,spawn.y,control,connected,lastDashSeq,lastSuperSeq));
+function resetPlayerState(p,id,control,lastDashSeq=0,connected=true,lastSuperSeq=0,level=game&&game.level||selectedLevel,occupied=[]){
+  let spawn=resolvedSpawnPoint(id,level,occupied);return Object.assign(p,createPlayerState(id,spawn.x,spawn.y,control,connected,lastDashSeq,lastSuperSeq));
 }
 function player(id,x,y,control='local',connected=true,lastDashSeq=0,lastSuperSeq=0){return createPlayerState(id,x,y,control,connected,lastDashSeq,lastSuperSeq)}
 function currentActionCursor(id){let value=remoteInputs.get(id)?.value||{};return{dashSeq:Math.max(0,Math.round(num(value.dashSeq))),superSeq:Math.max(0,Math.round(num(value.superSeq)))}}
@@ -1480,15 +1507,16 @@ function makeLevelObjects(level,difficulty){
   };
 }
 function makeGame(difficulty=selectedDifficulty,startLevel=selectedLevel){
-  difficulty=normalizeDifficulty(difficulty);let level=normalizeLevel(startLevel),parts=makeLevelObjects(level,difficulty),s=spawnPoint(0);
+  difficulty=normalizeDifficulty(difficulty);let level=normalizeLevel(startLevel),parts=makeLevelObjects(level,difficulty),s=resolvedSpawnPoint(0,level,[]);
   return{players:[player(0,s.x,s.y,'local',true)],coins:parts.coins,enemies:parts.enemies,powerups:parts.powerups,firePatches:[],inkSplats:[],inkSeq:0,difficulty,nextDifficulty:difficulty,level,startLevel:level,nextLevel:level,maxLevel:LEVELS.length,levelName:levelConfig(level).name,levelHint:levelConfig(level).gimmick||'',phase:'menu',count:0,phaseEndsAt:0,time:0,hazardTime:0,over:false,won:false,paused:false,exit:parts.exit,shake:0,timeStop:0,superFx:null,total:parts.coins.length};
 }
 function resetPlayersForLevel(){
-  for(const p of game.players){
-    let score=p.score,id=p.id,control=p.control,connected=p.connected!==false,input=id?remoteInputs.get(id)?.value:null;
+  let occupied=[];
+  for(const p of [...game.players].sort((a,b)=>a.id-b.id)){
+    let score=p.score,id=p.id,control=p.control,connected=p.connected!==false,input=remoteInputs.get(id)?.value;
     let lastDash=Math.max(0,Math.round(num(input?.dashSeq))),lastSuper=Math.max(0,Math.round(num(input?.superSeq)));
     let superSlots=sanitizeSuperSlots(p.superSlots),superMeter=clamp(num(p.superMeter),0,100),superBuild=sanitizeSuperBuild(p.superBuild),superPassive=clamp(num(p.superPassive),0,3);
-    resetPlayerState(p,id,control,lastDash,connected,lastSuper);p.score=score;
+    resetPlayerState(p,id,control,lastDash,connected,lastSuper,game.level,occupied);p.score=score;occupied.push(p);
     p.superSlots=superSlots;p.superMeter=superMeter;p.superBuild=superBuild;p.superPassive=superPassive;
   }
 }
@@ -2225,7 +2253,7 @@ function setTimedPhase(phase,seconds){game.phase=phase;game.count=Math.max(0,num
 function refreshTimedPhaseCount(){if(['count','level','clear'].includes(game.phase)&&game.phaseEndsAt>0)game.count=Math.max(0,(game.phaseEndsAt-Date.now())/1000)}
 function advanceTimedPhase(){
   if(!['count','level','clear'].includes(game.phase))return false;refreshTimedPhaseCount();if(game.count>0)return false;
-  game.count=0;game.phaseEndsAt=0;if(game.phase==='clear'){loadLevel(game.nextLevel);return true}game.phase='play';emit('go');return true
+  game.count=0;game.phaseEndsAt=0;if(game.phase==='clear'){loadLevel(game.nextLevel);return true}stabilizePlayersForPlayStart();game.phase='play';emit('go');return true
 }
 function loadLevel(level){
   level=normalizeLevel(level);advanceStateEpoch();let parts=makeLevelObjects(level,game.difficulty);
@@ -2244,13 +2272,13 @@ function forgetPlayer(id){
 function setConnectedPlayer(id,connected=true,generation='',fresh=false){
   id=clamp(Math.round(num(id)),0,ROOM_JOINERS);if(fresh)forgetPlayer(id);let p=game.players.find(x=>x.id===id),created=false;
   net.roster.set(id,{id,connected:!!connected});
-  if(!p){let s=spawnPoint(id);p=player(id,s.x,s.y,'remote',!!connected);game.players.push(p);game.players.sort((a,b)=>a.id-b.id);created=true}
+  if(!p){let occupied=game.players.filter(other=>other.id!==id&&other.connected!==false),s=resolvedSpawnPoint(id,game.level,occupied);p=player(id,s.x,s.y,'remote',!!connected);game.players.push(p);game.players.sort((a,b)=>a.id-b.id);created=true}
   p.control='remote';p.connected=!!connected;
   if(!connected){p.vx=0;p.vy=0;p.dt=0;neutralizeRemoteInput(id)}
   else{
     pendingRemoteDashes.delete(id);p.lastDashSeq=0;p.lastSuperSeq=0;
     remoteInputs.set(id,{value:inputSafe({}),seq:0,at:0,generation:String(generation||'')});
-    if(!p.alive&&(fresh||game.phase==='menu'))resetPlayerState(p,id,'remote',0,true,0);
+    if(!p.alive&&(fresh||game.phase==='menu'))resetPlayerState(p,id,'remote',0,true,0,game.level,game.players.filter(other=>other.id!==id&&other.connected!==false));
     if(created&&game.phase!=='menu'&&!game.over)p.inv=Math.max(p.inv,difficultyConfig(game.difficulty).invulnerability);
   }
   repairGameState();return p;
@@ -2268,15 +2296,17 @@ function inputCursor(id){
 }
 function startRun(difficulty='normal',level=1){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
-  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
-  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];
-  for(const id of connected){let spawn=spawnPoint(id),cursor=currentActionCursor(id);game.players.push(player(id,spawn.x,spawn.y,'remote',true,cursor.dashSeq,cursor.superSeq))}
+  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id).sort((a,b)=>a-b);
+  for(const id of connected)neutralizeRemoteInput(id);
+  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];let occupied=[];
+  for(const id of connected){let spawn=resolvedSpawnPoint(id,selectedLevel,occupied),cursor=currentActionCursor(id),p=player(id,spawn.x,spawn.y,'remote',true,cursor.dashSeq,cursor.superSeq);game.players.push(p);occupied.push(p)}
   game.players.sort((a,b)=>a.id-b.id);setTimedPhase('count',3);game.paused=false;game.over=false;game.won=false;emit('run');return publicGameState();
 }
 function returnToLobby(difficulty=game.difficulty,level=game.level){
   selectedDifficulty=normalizeDifficulty(difficulty);selectedLevel=normalizeLevel(level);advanceStateEpoch();
-  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id);
-  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];for(const id of connected){let spawn=spawnPoint(id),cursor=currentActionCursor(id);game.players.push(player(id,spawn.x,spawn.y,'remote',true,cursor.dashSeq,cursor.superSeq))}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
+  let connected=[...net.roster.entries()].filter(([,m])=>m.connected).map(([id])=>id).sort((a,b)=>a-b);
+  for(const id of connected)neutralizeRemoteInput(id);
+  game=makeGame(selectedDifficulty,selectedLevel);game.players=[];let occupied=[];for(const id of connected){let spawn=resolvedSpawnPoint(id,selectedLevel,occupied),cursor=currentActionCursor(id),p=player(id,spawn.x,spawn.y,'remote',true,cursor.dashSeq,cursor.superSeq);game.players.push(p);occupied.push(p)}game.players.sort((a,b)=>a.id-b.id);game.phase='menu';game.phaseEndsAt=0;game.count=0;emit('setup');return publicGameState();
 }
 function restartRun(){return startRun(game.difficulty,game.level)}
 function tick(dt){

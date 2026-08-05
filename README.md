@@ -1,15 +1,15 @@
-# Coin Dash Online — Authoritative Server v2.2.2
+# Coin Dash Online — Authoritative Server v2.2.3
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.5.8. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.5.9. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.5.8
-- Server: v2.2.2
-- Multiplayer protocol 19
-- Engine revision: `foundry-2026-08-05-r10`
+- Client: Coin Dash v1.5.9
+- Server: v2.2.3
+- Multiplayer protocol 20
+- Engine revision: `foundry-2026-08-05-r11`
 
-Deploy the server before the matching client because Cryo Shard gameplay behavior changed in the authoritative engine.
+Deploy the server before the matching client because player spawn placement changed in the authoritative engine.
 
 ## Production addresses
 
@@ -21,19 +21,20 @@ Expected health values:
 
 ```json
 {
-  "protocol": 19,
-  "version": 16,
-  "engine": "foundry-2026-08-05-r10"
+  "protocol": 20,
+  "version": 17,
+  "engine": "foundry-2026-08-05-r11"
 }
 ```
 
-## v2.2.2 changes
+## v2.2.3 changes
 
-- Cryo Shard is now a timed moving freeze field instead of a one-time pulse followed by a visual-only circle.
-- Enemies are frozen whenever they enter the visible 225-radius field and thaw shortly after leaving it.
-- Frozen enemies cannot deal contact damage.
-- Freeze duration, radius, enemy state, and contact rules are server authoritative for multiplayer.
-- Multiplayer protocol increased to 19 and engine revision increased to `foundry-2026-08-05-r10`.
+- Replaced fixed player coordinates with a deterministic level-aware spawn resolver.
+- Spawn positions are checked against walls, forced-movement hazards, damaging hazards, enemy start zones, arena borders, and other players.
+- New mid-game players use the same safe spawn resolver.
+- Every countdown-to-play transition clears residual velocity, dash, recoil, and trail state without clearing currently held movement input.
+- Starting or returning to a run neutralizes stale network movement while preserving input sequence counters.
+- Multiplayer protocol increased to 20 and engine revision increased to `foundry-2026-08-05-r11`.
 
 ## Existing room lifecycle behavior
 
@@ -47,6 +48,6 @@ Expected health values:
 1. Upload the five files from `1_SERVER_REPO_UPLOAD` to the root of the existing server repository.
 2. Keep the existing `package-lock.json` if present.
 3. Commit to the production branch connected to Cloudflare.
-4. Confirm the health endpoint shows protocol 19, version 16, and engine revision `foundry-2026-08-05-r10`.
+4. Confirm the health endpoint shows protocol 20, version 17, and engine revision `foundry-2026-08-05-r11`.
 5. Upload the matching client `index.html` to the GitHub Pages repository.
 6. Close and reopen the game on every device.
