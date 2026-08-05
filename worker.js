@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 14;
-const ENGINE_REVISION = "foundry-2026-08-04-r5";
+const PROTOCOL_VERSION = 15;
+const ENGINE_REVISION = "foundry-2026-08-04-r6";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -111,7 +111,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 10,
+        version: 11,
         engine: ENGINE_REVISION,
       });
     }
@@ -1018,8 +1018,8 @@ addFoundryHazard(9,{type:'flame',x:235,y:270,angle:0,length:135,width:32,period:
 addFoundryHazard(9,{type:'flame',x:725,y:270,angle:Math.PI,length:135,width:32,period:3.7,on:1.4,phase:2.05,color:'#9b4df2',fuel:'potassium'});
 addFoundryHazard(10,{type:'flame',x:30,y:150,angle:0,length:175,width:36,period:3.3,on:1.35,phase:.1,color:'#ed2b10',fuel:'inferno'});
 addFoundryHazard(10,{type:'flame',x:930,y:390,angle:Math.PI,length:175,width:36,period:3.3,on:1.35,phase:1.75,color:'#168cff',fuel:'acetylene'});
-const CAMPAIGN_LEVEL_COUNT=LEVELS.length;
-LEVELS.push(
+const REGULAR_LEVELS=LEVELS.slice();
+const SPECIAL_LEVELS=[
   {
     name:'Coin Cyclone',gimmick:'Chase three rotating coin rings',accent:'#ffd45d',depth:10,floorA:'#201807',floorB:'#574314',glow:'#ffd45d1d',speed:1,enemyBonus:0,bonus:true,bonusKind:'orbit',bonusTime:45,bonusRespawn:.8,
     walls:[r(438,228,84,84),r(175,100,72,30),r(713,100,72,30),r(175,410,72,30),r(713,410,72,30)],
@@ -1045,8 +1045,13 @@ LEVELS.push(
       {type:'gravity',x:650,y:270,radius:150,strength:-72,color:'#61e8ff'}
     ],exit:[480,270]
   }
+];
+LEVELS.splice(0,LEVELS.length,
+  ...REGULAR_LEVELS.slice(0,4),SPECIAL_LEVELS[0],
+  ...REGULAR_LEVELS.slice(4,8),SPECIAL_LEVELS[1],
+  ...REGULAR_LEVELS.slice(8),SPECIAL_LEVELS[2]
 );
-const BONUS_LEVEL_COUNT=LEVELS.length-CAMPAIGN_LEVEL_COUNT;
+const FINAL_LEVEL=LEVELS.length;
 function isBonusLevel(level=game&&game.level){return!!levelConfig(level).bonus}
 function normalizeLevel(v){return clamp(Math.round(num(v,1)),1,LEVELS.length)}
 function levelConfig(v){let map=LEVELS[normalizeLevel(v)-1];if(!map.hazards)map.hazards=[];return map}
@@ -1970,7 +1975,7 @@ function loadLevel(level){
 function beginLevelClear(nextLevel){game.nextLevel=normalizeLevel(nextLevel);setTimedPhase('clear',1.05);game.paused=false;for(const p of game.players){p.vx=0;p.vy=0;p.dt=0}for(const id of remoteInputs.keys())neutralizeRemoteInput(id);emit('clear')}
 function completeLevel(){
   for(const p of game.players)if(p.connected!==false)gainSuperEnergy(p,24,'survival');
-  let map=levelConfig(game.level);if(map.bonus)end(true);else if(game.level<CAMPAIGN_LEVEL_COUNT)beginLevelClear(game.level+1);else end(true);
+  if(game.level<FINAL_LEVEL)beginLevelClear(game.level+1);else end(true);
 }
 function end(won){game.over=true;game.won=!!won;game.phase='over';game.count=0;game.phaseEndsAt=0;game.paused=true;emit('end')}
 function setConnectedPlayer(id,connected=true,generation=''){
@@ -2027,7 +2032,7 @@ function tick(dt){
   for(const coin of game.coins)if(!coin.taken){let best=null,bd=190;for(const p of game.players)if(p.alive&&p.connected!==false&&p.magnet>0){let d=hypot(p.x-coin.x,p.y-coin.y);if(d<bd){bd=d;best=p}}if(best){let dx=best.x-coin.x,dy=best.y-coin.y,l=hypot(dx,dy)||1,s=Math.min(310,120+(190-l)*1.2);coin.x+=dx/l*s*dt;coin.y+=dy/l*s*dt;if(l<best.r+coin.r+4)collectCoin(best,coin)}}
   updateFirePatches(dt);updateInkSplats(dt);game.timeStop=Math.max(0,game.timeStop-dt);if(game.superFx){game.superFx.time=Math.max(0,game.superFx.time-dt);if(!game.superFx.time)game.superFx=null}
   let cfg=difficultyConfig(game.difficulty),map=levelConfig(game.level);for(const e of game.enemies)updateEnemy(e,dt,cfg,map);
-  let taken=game.coins.filter(c=>c.taken).length,boss=game.enemies.find(e=>e.type==='warden');if(!game.players.some(p=>p.alive&&p.connected!==false))end(false);else if(map.bonus){if(game.time>=num(map.bonusTime,45))end(true)}else if(map.boss){if(boss&&boss.defeated&&boss.deathTimer<=0)completeLevel()}else if(taken===game.total&&game.players.some(p=>p.alive&&p.connected!==false&&hypot(p.x-game.exit.x,p.y-game.exit.y)<p.r+game.exit.r))completeLevel();game.shake=Math.max(0,game.shake-dt);
+  let taken=game.coins.filter(c=>c.taken).length,boss=game.enemies.find(e=>e.type==='warden');if(!game.players.some(p=>p.alive&&p.connected!==false))end(false);else if(map.bonus){if(game.time>=num(map.bonusTime,45))completeLevel()}else if(map.boss){if(boss&&boss.defeated&&boss.deathTimer<=0)completeLevel()}else if(taken===game.total&&game.players.some(p=>p.alive&&p.connected!==false&&hypot(p.x-game.exit.x,p.y-game.exit.y)<p.r+game.exit.r))completeLevel();game.shake=Math.max(0,game.shake-dt);
 }
 function compactMotionState(){return{t:'motion',pv:PROTOCOL_VERSION,epoch:net.stateEpoch,seq:++net.motionSeq,ts:Math.round(performance.now()),p:game.players.map(p=>[p.id,quantize(p.x),quantize(p.y),quantize(p.vx),quantize(p.vy),quantize(p.dt,100),quantize(p.dx,100),quantize(p.dy,100),quantize(p.faceX,100),quantize(p.faceY,100),quantize(p.bob,100),quantize(p.inv,100),quantize(p.dashHit,100),Math.max(0,Math.round(num(p.lastDashSeq,0))),quantize(p.hitTime,100)]),e:game.enemies.map(e=>[quantize(e.x),quantize(e.y),quantize(e.vx),quantize(e.vy),quantize(e.phase,100),valueIndex(ENEMY_MODE_KEYS,e.mode),quantize(e.aimX,100),quantize(e.aimY,100),quantize(e.pulseRadius),quantize(e.burn,100),quantize(e.stun,100),quantize(e.armProgress,100),quantize(e.armLength),quantize(e.armTargetX),quantize(e.armTargetY),quantize(e.inkCharge,100)]),c:game.coins.map(c=>[quantize(c.x),quantize(c.y),c.taken?1:0])}}
 function fullState(){repairGameState();refreshTimedPhaseCount();return publicGameState()}
