@@ -13,8 +13,10 @@ const STATE_INTERVAL_MS = 1000 / 4;
 const PERSIST_INTERVAL_MS = 10_000;
 const MAX_CATCHUP_STEPS = 6;
 const OWNER_GRACE_MS = 60_000;
+const CLIENT_ACTIVITY_TTL_MS = 45_000;
+const EMPTY_ROOM_GRACE_MS = 2 * 60 * 1000;
 const DIRECTORY_REFRESH_MS = 30_000;
-const DIRECTORY_STALE_MS = 3 * 60 * 1000;
+const DIRECTORY_STALE_MS = 75_000;
 const RATE_WINDOWS = {
   input: { limit: 50, windowMs: 1000 },
   ping: { limit: 6, windowMs: 3000 },
@@ -113,7 +115,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 14,
+        version: 15,
         engine: ENGINE_REVISION,
       });
     }
@@ -286,8 +288,10 @@ export class GameRoom {
       for (const row of roster) if (row.connected) this.engine.setConnectedPlayer(row.id, true);
     }
 
-    if (liveIds.size && !this.ownerConnected()) this.maybeMigrateOwner();
-    if (this.engine.game.phase !== "menu" && !this.engine.game.over && liveIds.size) this.startLoop();
+    this.refreshEmptyState();
+    await this.scheduleMaintenanceAlarm();
+    if (this.connectedPlayerIds().length && !this.ownerConnected()) this.maybeMigrateOwner();
+    if (this.engine.game.phase !== "menu" && !this.engine.game.over && this.connectedPlayerIds().length) this.startLoop();
   }
 
   async fetch(request) {
@@ -307,13 +311,14 @@ export class GameRoom {
         ownerClient,
         ownerId: 0,
         ownerDisconnectedAt: now,
+        emptySince: now,
         level: 1,
         difficulty: "normal",
         ready: { 0: true },
         slots: { [ownerClient]: { id: 0, lastSeen: now } },
       };
       await this.persist(true);
-      await this.ctx.storage.setAlarm(now + ROOM_LIFETIME_MS);
+      await this.scheduleMaintenanceAlarm();
       this.scheduleDirectoryUpdate(true);
       return json(request, this.env, { ok: true }, 201);
     }
@@ -335,6 +340,12 @@ export class GameRoom {
     let id;
     const existing = this.meta.slots[clientId];
     const reconnecting = !!(existing && Number.isInteger(existing.id));
+    if (!reconnecting && requestedRole === "player" && this.connectedPlayerIds().length === 0) {
+      this.refreshEmptyState();
+      this.scheduleDirectoryUpdate(true);
+      this.ctx.waitUntil(this.scheduleMaintenanceAlarm());
+      return json(request, this.env, { error: "Room is no longer active." }, 410);
+    }
     if (reconnecting) {
       id = existing.id;
     } else if (requestedRole === "host") {
@@ -371,6 +382,7 @@ export class GameRoom {
       clientId,
       connectionId,
       connectedAt: Date.now(),
+      lastActivityAt: Date.now(),
       replaced: false,
       released: false,
     };
@@ -378,6 +390,7 @@ export class GameRoom {
     this.ctx.acceptWebSocket(server);
 
     this.engine.setConnectedPlayer(id, true, connectionId, !reconnecting);
+    this.meta.emptySince = 0;
     if (this.isOwner(id, clientId)) {
       this.meta.ready[id] = true;
       this.meta.ownerDisconnectedAt = 0;
@@ -396,6 +409,7 @@ export class GameRoom {
     if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
     this.schedulePersist();
     this.scheduleDirectoryUpdate(true);
+    this.ctx.waitUntil(this.scheduleMaintenanceAlarm());
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -425,6 +439,13 @@ export class GameRoom {
     if (member.replaced || member.released) return;
     const id = Number.isInteger(member.id) ? member.id : -1;
     if (id < 0) return;
+
+    const activityAt = Date.now();
+    socket.serializeAttachment({ ...member, lastActivityAt: activityAt });
+    if (member.clientId && this.meta.slots[member.clientId]) this.meta.slots[member.clientId].lastSeen = activityAt;
+    if (this.meta.emptySince) this.meta.emptySince = 0;
+    this.ctx.waitUntil(this.scheduleMaintenanceAlarm());
+    if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
 
     this.maybeMigrateOwner();
 
@@ -583,9 +604,11 @@ export class GameRoom {
     }
     this.broadcast({ t: "notice", tone: "error", text: ownerLeft ? "ROOM OWNER RECONNECTING" : `P${id + 1} DISCONNECTED` }, socket);
     this.broadcastLobby();
+    this.refreshEmptyState();
     this.schedulePersist(true);
     this.scheduleDirectoryUpdate(true);
-    if (!this.ctx.getWebSockets().length) this.stopLoop();
+    this.ctx.waitUntil(this.scheduleMaintenanceAlarm());
+    if (!this.connectedPlayerIds().length) this.stopLoop();
   }
 
   webSocketError(socket) {
@@ -596,15 +619,25 @@ export class GameRoom {
 
   async alarm() {
     await this.loading;
-    if (this.ctx.getWebSockets().length) {
-      await this.ctx.storage.setAlarm(Date.now() + ROOM_LIFETIME_MS);
-      this.scheduleDirectoryUpdate(true);
+    if (!this.meta) return;
+    const now = Date.now();
+    this.reapExpiredSlots();
+    this.refreshEmptyState(now);
+    const hardExpiresAt = Number(this.meta.createdAt || now) + ROOM_LIFETIME_MS;
+    const emptyExpiresAt = this.meta.emptySince ? Number(this.meta.emptySince) + EMPTY_ROOM_GRACE_MS : Infinity;
+    if (now >= hardExpiresAt || now >= emptyExpiresAt) {
+      await this.destroyRoom(now >= hardExpiresAt ? "Room expired." : "Empty room closed.");
       return;
     }
-    this.stopLoop();
-    await this.removeFromDirectory();
-    await this.ctx.storage.deleteAll();
-    this.meta = null;
+    if (this.connectedPlayerIds(now).length) {
+      await this.updateDirectory();
+      if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
+    } else {
+      this.stopLoop();
+      await this.removeFromDirectory();
+    }
+    await this.persist();
+    await this.scheduleMaintenanceAlarm(now);
   }
 
   normalizeMeta() {
@@ -614,6 +647,7 @@ export class GameRoom {
     if (!this.meta.ready || typeof this.meta.ready !== "object") this.meta.ready = {};
     if (!Number.isInteger(this.meta.ownerId)) this.meta.ownerId = this.meta.ownerClient ? 0 : -1;
     if (!Number.isFinite(Number(this.meta.ownerDisconnectedAt))) this.meta.ownerDisconnectedAt = 0;
+    if (!Number.isFinite(Number(this.meta.emptySince))) this.meta.emptySince = 0;
     if (this.meta.ownerClient && !this.meta.slots[this.meta.ownerClient]) {
       this.meta.slots[this.meta.ownerClient] = { id: Math.max(0, this.meta.ownerId), lastSeen: Date.now() };
     }
@@ -623,11 +657,11 @@ export class GameRoom {
     return !!this.meta && Number(id) === Number(this.meta.ownerId) && !!clientId && clientId === this.meta.ownerClient;
   }
 
-  ownerConnected() {
+  ownerConnected(now = Date.now()) {
     if (!this.meta || !this.meta.ownerClient) return false;
     return this.ctx.getWebSockets().some((socket) => {
       const member = socket.deserializeAttachment() || {};
-      return !member.replaced && !member.released && member.clientId === this.meta.ownerClient && member.id === this.meta.ownerId;
+      return this.memberIsActive(member, now) && member.clientId === this.meta.ownerClient && member.id === this.meta.ownerId;
     });
   }
 
@@ -659,7 +693,7 @@ export class GameRoom {
     }
     const candidates = this.ctx.getWebSockets()
       .map((socket) => ({ socket, member: socket.deserializeAttachment() || {} }))
-      .filter(({ member }) => Number.isInteger(member.id) && !member.replaced && !member.released)
+      .filter(({ member }) => this.memberIsActive(member))
       .sort((a, b) => a.member.id - b.member.id);
     if (!candidates.length) return false;
     const next = candidates[0];
@@ -702,13 +736,57 @@ export class GameRoom {
     return bucket.count <= limit;
   }
 
-  connectedPlayerIds() {
+  memberIsActive(member, now = Date.now()) {
+    if (!member || !Number.isInteger(member.id) || member.replaced || member.released) return false;
+    const lastActivityAt = Number(member.lastActivityAt || member.connectedAt || 0);
+    return lastActivityAt > 0 && now - lastActivityAt <= CLIENT_ACTIVITY_TTL_MS;
+  }
+
+  connectedPlayerIds(now = Date.now()) {
     const ids = new Set();
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = socket.deserializeAttachment() || {};
-      if (Number.isInteger(attachment.id) && !attachment.replaced && !attachment.released) ids.add(attachment.id);
+      if (this.memberIsActive(attachment, now)) ids.add(attachment.id);
     }
     return [...ids].sort((a, b) => a - b);
+  }
+
+  refreshEmptyState(now = Date.now()) {
+    if (!this.meta) return true;
+    const empty = this.connectedPlayerIds(now).length === 0;
+    if (empty) {
+      if (!this.meta.emptySince) this.meta.emptySince = now;
+    } else {
+      this.meta.emptySince = 0;
+    }
+    return empty;
+  }
+
+  async scheduleMaintenanceAlarm(now = Date.now()) {
+    if (!this.meta) return;
+    this.refreshEmptyState(now);
+    const deadlines = [Number(this.meta.createdAt || now) + ROOM_LIFETIME_MS];
+    if (this.meta.emptySince) deadlines.push(Number(this.meta.emptySince) + EMPTY_ROOM_GRACE_MS);
+    for (const socket of this.ctx.getWebSockets()) {
+      const member = socket.deserializeAttachment() || {};
+      if (!member || member.replaced || member.released) continue;
+      const lastActivityAt = Number(member.lastActivityAt || member.connectedAt || 0);
+      if (lastActivityAt > 0 && lastActivityAt + CLIENT_ACTIVITY_TTL_MS > now) deadlines.push(lastActivityAt + CLIENT_ACTIVITY_TTL_MS);
+    }
+    const next = Math.max(now + 1000, Math.min(...deadlines.filter(Number.isFinite)));
+    await this.ctx.storage.setAlarm(next);
+  }
+
+  async destroyRoom(reason = "Room closed.") {
+    if (!this.meta) return;
+    this.broadcast({ t: "roomClosed", reason });
+    this.stopLoop();
+    for (const socket of this.ctx.getWebSockets()) {
+      try { socket.close(1000, reason); } catch {}
+    }
+    await this.removeFromDirectory();
+    await this.ctx.storage.deleteAll();
+    this.meta = null;
   }
 
   lobbyPacket() {
@@ -798,15 +876,17 @@ export class GameRoom {
     }
     this.broadcast({ t: "notice", tone: "error", text: `P${id + 1} LEFT` });
     this.broadcastLobby();
+    this.refreshEmptyState();
     this.schedulePersist(true);
     this.scheduleDirectoryUpdate(true);
+    this.ctx.waitUntil(this.scheduleMaintenanceAlarm());
   }
 
   reapExpiredSlots() {
     const now = Date.now();
     const connectedClients = new Set(this.ctx.getWebSockets()
       .map((socket) => socket.deserializeAttachment() || {})
-      .filter((member) => !member.replaced && !member.released && member.clientId)
+      .filter((member) => this.memberIsActive(member) && member.clientId)
       .map((member) => member.clientId));
     for (const [clientId, slot] of Object.entries(this.meta.slots)) {
       if (connectedClients.has(clientId)) continue;
@@ -881,7 +961,7 @@ export class GameRoom {
       if (now - this.lastPersistAt >= PERSIST_INTERVAL_MS) this.schedulePersist();
       if (Date.now() - this.lastDirectoryAt >= DIRECTORY_REFRESH_MS) this.scheduleDirectoryUpdate();
 
-      if (this.engine.game.phase === "menu" || this.engine.game.over || this.engine.game.paused || !this.ctx.getWebSockets().length) {
+      if (this.engine.game.phase === "menu" || this.engine.game.over || this.engine.game.paused || !this.connectedPlayerIds().length) {
         this.stopLoop();
         return;
       }
@@ -947,6 +1027,10 @@ export class GameRoom {
   async updateDirectory() {
     const entry = this.directoryEntry();
     if (!entry || !this.env.DIRECTORY) return;
+    if (entry.players < 1) {
+      await this.removeFromDirectory();
+      return;
+    }
     const directory = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("global"));
     try {
       await directory.fetch("https://directory.internal/update", {
