@@ -13,6 +13,10 @@
       {
         "name": "ROOMS",
         "class_name": "GameRoom"
+      },
+      {
+        "name": "DIRECTORY",
+        "class_name": "RoomDirectory"
       }
     ]
   },
@@ -21,6 +25,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["GameRoom"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RoomDirectory"]
     }
   ],
 

@@ -5,14 +5,16 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 17;
-const ENGINE_REVISION = "foundry-2026-08-05-r8";
+const PROTOCOL_VERSION = 18;
+const ENGINE_REVISION = "foundry-2026-08-05-r9";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
 const PERSIST_INTERVAL_MS = 10_000;
 const MAX_CATCHUP_STEPS = 6;
-const OWNER_GRACE_MS = 7_000;
+const OWNER_GRACE_MS = 60_000;
+const DIRECTORY_REFRESH_MS = 30_000;
+const DIRECTORY_STALE_MS = 3 * 60 * 1000;
 const RATE_WINDOWS = {
   input: { limit: 50, windowMs: 1000 },
   ping: { limit: 6, windowMs: 3000 },
@@ -111,9 +113,16 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 13,
+        version: 14,
         engine: ENGINE_REVISION,
       });
+    }
+
+    if (url.pathname === "/rooms" && request.method === "GET") {
+      const directory = env.DIRECTORY.get(env.DIRECTORY.idFromName("global"));
+      const listed = await directory.fetch("https://directory.internal/list");
+      const data = await listed.json();
+      return json(request, env, data, listed.status);
     }
 
     if (url.pathname === "/rooms" && request.method === "POST") {
@@ -125,7 +134,7 @@ export default {
         const code = makeRoomCode();
         const id = env.ROOMS.idFromName(code);
         const room = env.ROOMS.get(id);
-        const created = await room.fetch(`https://room.internal/create?client=${encodeURIComponent(ownerClient)}`, { method: "POST" });
+        const created = await room.fetch(`https://room.internal/create?client=${encodeURIComponent(ownerClient)}&code=${encodeURIComponent(code)}`, { method: "POST" });
         if (created.status === 201) {
           return json(request, env, { code, protocol: PROTOCOL_VERSION, mode: "authoritative" }, 201);
         }
@@ -143,6 +152,83 @@ export default {
     return json(request, env, { error: "Not found." }, 404);
   },
 };
+
+
+export class RoomDirectory {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  normalizeEntry(value, now = Date.now()) {
+    const code = normalizeRoomCode(value && value.code);
+    if (code.length !== ROOM_CODE_LENGTH) return null;
+    const players = Math.max(0, Math.min(MAX_PLAYERS, Math.round(Number(value.players) || 0)));
+    const phase = ["lobby", "playing", "results"].includes(value.phase) ? value.phase : "lobby";
+    return {
+      code,
+      players,
+      capacity: MAX_PLAYERS,
+      phase,
+      level: Math.max(1, Math.round(Number(value.level) || 1)),
+      difficulty: ["easy", "normal", "hard"].includes(value.difficulty) ? value.difficulty : "normal",
+      joinable: players > 0 && players < MAX_PLAYERS && value.joinable !== false,
+      createdAt: Math.max(0, Number(value.createdAt) || now),
+      updatedAt: now,
+    };
+  }
+
+  prune(rooms, now = Date.now()) {
+    let changed = false;
+    for (const [code, room] of Object.entries(rooms)) {
+      if (!room || now - Number(room.updatedAt || 0) > DIRECTORY_STALE_MS) {
+        delete rooms[code];
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const rooms = (await this.ctx.storage.get("rooms")) || {};
+    const now = Date.now();
+    let changed = this.prune(rooms, now);
+
+    if (url.pathname === "/list" && request.method === "GET") {
+      if (changed) await this.ctx.storage.put("rooms", rooms);
+      const list = Object.values(rooms)
+        .filter((room) => room && room.players > 0)
+        .sort((a, b) => Number(b.joinable) - Number(a.joinable) || Number(a.phase !== "lobby") - Number(b.phase !== "lobby") || b.updatedAt - a.updatedAt)
+        .slice(0, 40);
+      return json(request, this.env, { rooms: list, protocol: PROTOCOL_VERSION, updatedAt: now });
+    }
+
+    if (url.pathname === "/update" && request.method === "POST") {
+      let body = null;
+      try { body = await request.json(); } catch {}
+      const entry = this.normalizeEntry(body, now);
+      if (!entry) return json(request, this.env, { error: "Invalid room." }, 400);
+      rooms[entry.code] = entry;
+      await this.ctx.storage.put("rooms", rooms);
+      return json(request, this.env, { ok: true });
+    }
+
+    if (url.pathname === "/remove" && request.method === "POST") {
+      let body = null;
+      try { body = await request.json(); } catch {}
+      const code = normalizeRoomCode(body && body.code);
+      if (code && rooms[code]) {
+        delete rooms[code];
+        changed = true;
+      }
+      if (changed) await this.ctx.storage.put("rooms", rooms);
+      return json(request, this.env, { ok: true });
+    }
+
+    return json(request, this.env, { error: "Not found." }, 404);
+  }
+}
 
 export class GameRoom {
   constructor(ctx, env) {
@@ -163,6 +249,7 @@ export class GameRoom {
     this.lastMotionAt = 0;
     this.lastStateAt = 0;
     this.lastPersistAt = 0;
+    this.lastDirectoryAt = 0;
     this.fireEventSeq = 0;
     this.ownerMigrationTimer = null;
     this.rateBuckets = new Map();
@@ -210,9 +297,12 @@ export class GameRoom {
     if (url.pathname === "/create" && request.method === "POST") {
       if (this.meta) return json(request, this.env, { error: "Room already exists." }, 409);
       const ownerClient = safeClientId(url.searchParams.get("client"));
+      const code = normalizeRoomCode(url.searchParams.get("code"));
       if (!ownerClient) return json(request, this.env, { error: "Missing owner client ID." }, 400);
+      if (code.length !== ROOM_CODE_LENGTH) return json(request, this.env, { error: "Missing room code." }, 400);
       const now = Date.now();
       this.meta = {
+        code,
         createdAt: now,
         ownerClient,
         ownerId: 0,
@@ -224,10 +314,13 @@ export class GameRoom {
       };
       await this.persist(true);
       await this.ctx.storage.setAlarm(now + ROOM_LIFETIME_MS);
+      this.scheduleDirectoryUpdate(true);
       return json(request, this.env, { ok: true }, 201);
     }
 
     if (!this.meta) return json(request, this.env, { error: "Room not found." }, 404);
+    const routedCode = normalizeRoomCode(url.pathname.split("/").filter(Boolean).at(-2));
+    if (!this.meta.code && routedCode.length === ROOM_CODE_LENGTH) this.meta.code = routedCode;
     if (!originAllowed(request, this.env)) return json(request, this.env, { error: "Origin not allowed." }, 403);
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return json(request, this.env, { error: "WebSocket required." }, 426);
@@ -302,6 +395,7 @@ export class GameRoom {
     this.maybeMigrateOwner();
     if (this.engine.game.phase !== "menu" && !this.engine.game.over) this.startLoop();
     this.schedulePersist();
+    this.scheduleDirectoryUpdate(true);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -337,6 +431,7 @@ export class GameRoom {
     if (payload.t === "ping") {
       if (!this.allowMessage(member, "ping")) return;
       this.engine.wake();
+      this.scheduleDirectoryUpdate();
       this.send(socket, { t: "pong", at: Number(payload.at) || Date.now(), serverAt: Date.now() });
       return;
     }
@@ -384,6 +479,7 @@ export class GameRoom {
           this.meta.level = settings.level;
           this.broadcastLobby();
           this.schedulePersist();
+          this.scheduleDirectoryUpdate(true);
         }
         break;
       case "start":
@@ -396,6 +492,7 @@ export class GameRoom {
           this.engine.startRun(this.meta.difficulty, this.meta.level);
           this.startLoop();
           this.schedulePersist(true);
+          this.scheduleDirectoryUpdate(true);
         }
         break;
       case "startLevel":
@@ -407,6 +504,7 @@ export class GameRoom {
           this.startLoop();
           this.broadcastLobby();
           this.schedulePersist(true);
+          this.scheduleDirectoryUpdate(true);
         }
         break;
       case "pause":
@@ -417,6 +515,7 @@ export class GameRoom {
         if (owner) {
           this.engine.restartRun();
           this.startLoop();
+          this.scheduleDirectoryUpdate(true);
         }
         break;
       case "lobby":
@@ -426,6 +525,7 @@ export class GameRoom {
           this.stopLoop();
           this.broadcastLobby();
           this.schedulePersist(true);
+          this.scheduleDirectoryUpdate(true);
         }
         break;
       case "sync":
@@ -441,6 +541,7 @@ export class GameRoom {
           for (const connectedSocket of this.ctx.getWebSockets()) {
             try { connectedSocket.close(1000, "Room closed"); } catch {}
           }
+          await this.removeFromDirectory();
           await this.ctx.storage.deleteAll();
           this.meta = null;
         }
@@ -483,6 +584,7 @@ export class GameRoom {
     this.broadcast({ t: "notice", tone: "error", text: ownerLeft ? "ROOM OWNER RECONNECTING" : `P${id + 1} DISCONNECTED` }, socket);
     this.broadcastLobby();
     this.schedulePersist(true);
+    this.scheduleDirectoryUpdate(true);
     if (!this.ctx.getWebSockets().length) this.stopLoop();
   }
 
@@ -496,15 +598,18 @@ export class GameRoom {
     await this.loading;
     if (this.ctx.getWebSockets().length) {
       await this.ctx.storage.setAlarm(Date.now() + ROOM_LIFETIME_MS);
+      this.scheduleDirectoryUpdate(true);
       return;
     }
     this.stopLoop();
+    await this.removeFromDirectory();
     await this.ctx.storage.deleteAll();
     this.meta = null;
   }
 
   normalizeMeta() {
     if (!this.meta) return;
+    if (typeof this.meta.code !== "string") this.meta.code = "";
     if (!this.meta.slots || typeof this.meta.slots !== "object") this.meta.slots = {};
     if (!this.meta.ready || typeof this.meta.ready !== "object") this.meta.ready = {};
     if (!Number.isInteger(this.meta.ownerId)) this.meta.ownerId = this.meta.ownerClient ? 0 : -1;
@@ -694,6 +799,7 @@ export class GameRoom {
     this.broadcast({ t: "notice", tone: "error", text: `P${id + 1} LEFT` });
     this.broadcastLobby();
     this.schedulePersist(true);
+    this.scheduleDirectoryUpdate(true);
   }
 
   reapExpiredSlots() {
@@ -720,6 +826,7 @@ export class GameRoom {
     if (["run", "level", "go"].includes(kind)) this.startLoop();
     if (["end", "setup"].includes(kind)) this.stopLoop();
     this.schedulePersist(true);
+    if (["run", "level", "setup", "end", "go"].includes(kind)) this.scheduleDirectoryUpdate(true);
   }
 
   broadcastFire(row) {
@@ -772,6 +879,7 @@ export class GameRoom {
         });
       }
       if (now - this.lastPersistAt >= PERSIST_INTERVAL_MS) this.schedulePersist();
+      if (Date.now() - this.lastDirectoryAt >= DIRECTORY_REFRESH_MS) this.scheduleDirectoryUpdate();
 
       if (this.engine.game.phase === "menu" || this.engine.game.over || this.engine.game.paused || !this.ctx.getWebSockets().length) {
         this.stopLoop();
@@ -809,6 +917,57 @@ export class GameRoom {
         socket.send(message);
       } catch {}
     }
+  }
+
+  directoryEntry() {
+    if (!this.meta) return null;
+    const code = normalizeRoomCode(this.meta.code);
+    if (code.length !== ROOM_CODE_LENGTH) return null;
+    const players = this.connectedPlayerIds().length;
+    const phase = this.engine.game.phase === "menu" ? "lobby" : this.engine.game.over ? "results" : "playing";
+    return {
+      code,
+      players,
+      capacity: MAX_PLAYERS,
+      phase,
+      level: Math.max(1, Number(this.engine.game.level || this.meta.level) || 1),
+      difficulty: this.meta.difficulty,
+      joinable: players > 0 && players < MAX_PLAYERS,
+      createdAt: Number(this.meta.createdAt) || Date.now(),
+    };
+  }
+
+  scheduleDirectoryUpdate(immediate = false) {
+    const now = Date.now();
+    if (!immediate && now - this.lastDirectoryAt < DIRECTORY_REFRESH_MS) return;
+    this.lastDirectoryAt = now;
+    this.ctx.waitUntil(this.updateDirectory());
+  }
+
+  async updateDirectory() {
+    const entry = this.directoryEntry();
+    if (!entry || !this.env.DIRECTORY) return;
+    const directory = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("global"));
+    try {
+      await directory.fetch("https://directory.internal/update", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(entry),
+      });
+    } catch {}
+  }
+
+  async removeFromDirectory() {
+    const code = normalizeRoomCode(this.meta && this.meta.code);
+    if (code.length !== ROOM_CODE_LENGTH || !this.env.DIRECTORY) return;
+    const directory = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("global"));
+    try {
+      await directory.fetch("https://directory.internal/remove", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+    } catch {}
   }
 
   schedulePersist(immediate = false) {
