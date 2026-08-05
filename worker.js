@@ -1,12 +1,12 @@
 const GAME_ORIGIN = "https://kakrami.github.io";
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const ROOM_CODE_LENGTH = 6;
+const ROOM_CODE_LENGTH = 4;
 const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 15;
-const ENGINE_REVISION = "foundry-2026-08-04-r6";
+const PROTOCOL_VERSION = 16;
+const ENGINE_REVISION = "foundry-2026-08-05-r7";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -65,7 +65,7 @@ function makeRoomCode() {
 function normalizeRoomCode(value) {
   return String(value || "")
     .toUpperCase()
-    .replace(/[^A-Z2-9]/g, "")
+    .replace(/[^A-HJ-NP-Z2-9]/g, "")
     .slice(0, ROOM_CODE_LENGTH);
 }
 
@@ -111,7 +111,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 11,
+        version: 12,
         engine: ENGINE_REVISION,
       });
     }
@@ -133,7 +133,7 @@ export default {
       return json(request, env, { error: "Could not create a room." }, 503);
     }
 
-    const roomMatch = url.pathname.match(/^\/rooms\/([A-Z2-9]{6})\/socket$/i);
+    const roomMatch = url.pathname.match(new RegExp(`^/rooms/([A-HJ-NP-Z2-9]{${ROOM_CODE_LENGTH}})/socket$`, "i"));
     if (roomMatch) {
       const code = normalizeRoomCode(roomMatch[1]);
       const id = env.ROOMS.idFromName(code);
