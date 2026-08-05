@@ -6,7 +6,7 @@ const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
 const PROTOCOL_VERSION = 20;
-const ENGINE_REVISION = "foundry-2026-08-05-r11";
+const ENGINE_REVISION = "foundry-2026-08-05-r12";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -115,7 +115,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 18,
+        version: 19,
         engine: ENGINE_REVISION,
       });
     }
@@ -1400,7 +1400,7 @@ function repairGameState(target=game){
   if(!Array.isArray(target.inkSplats))target.inkSplats=[];
   target.inkSplats=target.inkSplats.filter(s=>s&&isGoodNum(s.x)&&isGoodNum(s.y)&&num(s.life)>0).map(s=>({id:Math.max(0,Math.round(num(s.id))),x:clamp(num(s.x),-80,W+80),y:clamp(num(s.y),-80,H+80),r:clamp(num(s.r,54),24,110),life:clamp(num(s.life),0,6),maxLife:clamp(num(s.maxLife,s.life),.5,6),phase:num(s.phase),tone:clamp(Math.round(num(s.tone)),0,2)})).slice(-12);
   if(!Array.isArray(target.powerups))target.powerups=[];
-  target.powerups=target.powerups.filter(x=>x&&POWER_DEFS[x.type]&&isGoodNum(x.x)&&isGoodNum(x.y)).map(x=>({...x,r:clamp(num(x.r,12),7,18),taken:!!x.taken,pulse:num(x.pulse),respawnAt:Math.max(0,num(x.respawnAt))}));
+  target.powerups=(isBonusLevel(target.level)?[]:target.powerups).filter(x=>x&&POWER_DEFS[x.type]&&isGoodNum(x.x)&&isGoodNum(x.y)).map(x=>({...x,r:clamp(num(x.r,12),7,18),taken:!!x.taken,pulse:num(x.pulse),respawnAt:Math.max(0,num(x.respawnAt))}));
   if(!Array.isArray(target.enemies))target.enemies=[];
   for(const e of target.enemies){
     e.type=ENEMY_DEFS[e.type]?e.type:'hunter';let def=ENEMY_DEFS[e.type];
@@ -1521,7 +1521,7 @@ function makeLevelObjects(level,difficulty){
   return{
     coins:map.bonus?makeBonusCoins(map):map.coins.map((p,i)=>({x:p[0],y:p[1],r:9,taken:false,pulse:i*.3,value:1})),
     enemies,
-    powerups:levelPowerSpecs(level).map((p,i)=>powerup(p[0],p[1],p[2],i)),
+    powerups:map.bonus?[]:levelPowerSpecs(level).map((p,i)=>powerup(p[0],p[1],p[2],i)),
     exit:{x:map.exit[0],y:map.exit[1],r:28}
   };
 }
