@@ -5,8 +5,8 @@ const MAX_PLAYERS = 5;
 const MAX_MESSAGE_BYTES = 32 * 1024;
 const ROOM_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const DISCONNECTED_SLOT_TTL_MS = 2 * 60 * 1000;
-const PROTOCOL_VERSION = 18;
-const ENGINE_REVISION = "foundry-2026-08-05-r9";
+const PROTOCOL_VERSION = 19;
+const ENGINE_REVISION = "foundry-2026-08-05-r10";
 const SIMULATION_STEP_MS = 1000 / 60;
 const MOTION_INTERVAL_MS = 1000 / 30;
 const STATE_INTERVAL_MS = 1000 / 4;
@@ -115,7 +115,7 @@ export default {
         service: "coin-dash-online",
         mode: "authoritative",
         protocol: PROTOCOL_VERSION,
-        version: 15,
+        version: 16,
         engine: ENGINE_REVISION,
       });
     }
@@ -1085,7 +1085,7 @@ const POWER_DEFS={
   magnet:{label:'Flux Orb',short:'Magnet',color:'#d86cff',shape:'magnet'},
   boost:{label:'Inferno Core',short:'Boost',color:'#ff6a1f',shape:'bolt'},
   freeze:{label:'Cryo Shard',short:'Freeze',color:'#6af4ff',shape:'cube'},
-  repair:{label:'Nanite Bloom',short:'Repair',color:'#61ff88',shape:'cross'}
+  repair:{label:'Heart Pack',short:'Heal',color:'#ff4d67',shape:'heart'}
 };
 const NOVA_RADIUS=300;
 const STARTING_SUPER_TYPES=['phase'];
@@ -1094,8 +1094,8 @@ const SUPER_DEFS={
   phase:{label:'Star Surge',color:'#ffd84d',cooldown:18,style:'survival',tool:'star'},
   timestop:{label:'Cryo Freeze',color:'#6af4ff',cooldown:20,style:'collect',tool:'ice'}
 };
-const POWER_TIMERS={magnet:8,boost:7,phase:6,freeze:1.35,timestop:7};
-const CRYO_RADIUS=225,CRYO_LOCK=4.4,WARDEN_CRYO_LOCK=1.9,QUENCH_SLOW=.58,DASH_ENEMY_GRACE=.14,SHIELD_BREAK_GRACE=1.05;
+const POWER_TIMERS={magnet:8,boost:7,phase:6,freeze:5.5,timestop:7};
+const CRYO_RADIUS=225,CRYO_AURA_LOCK=.34,WARDEN_CRYO_AURA_LOCK=.2,QUENCH_SLOW=.58,DASH_ENEMY_GRACE=.14,SHIELD_BREAK_GRACE=1.05;
 const ENEMY_DEFS={
   hunter:{label:'Ember Hound',color:'#ff3e24',light:'#ffbe75',dark:'#351008',radius:14,speed:1,accel:1},
   scout:{label:'Spark Wasp',color:'#29dcff',light:'#d5fbff',dark:'#06333c',radius:10,speed:1.34,accel:1.12},
@@ -1386,7 +1386,7 @@ function repairGameState(target=game){
   for(const e of target.enemies){
     e.type=ENEMY_DEFS[e.type]?e.type:'hunter';let def=ENEMY_DEFS[e.type];
     e.x=clamp(num(e.x,480),24+def.radius,W-24-def.radius);e.y=clamp(num(e.y,270),24+def.radius,H-24-def.radius);
-    e.vx=num(e.vx);e.vy=num(e.vy);e.r=clamp(num(e.r,def.radius),8,50);e.stun=clamp(num(e.stun),0,3);e.cryo=clamp(num(e.cryo),0,CRYO_LOCK);
+    e.vx=num(e.vx);e.vy=num(e.vy);e.r=clamp(num(e.r,def.radius),8,50);e.stun=clamp(num(e.stun),0,3);e.cryo=clamp(num(e.cryo),0,POWER_TIMERS.freeze);
     e.homeX=num(e.homeX,e.x);e.homeY=num(e.homeY,e.y);e.phase=num(e.phase);e.cooldown=clamp(num(e.cooldown),0,8);e.aiTimer=clamp(num(e.aiTimer),0,3);
     e.aimX=num(e.aimX,1);e.aimY=num(e.aimY);let al=hypot(e.aimX,e.aimY);if(al>.001){e.aimX/=al;e.aimY/=al}else{e.aimX=1;e.aimY=0}
     e.mode=['chase','windup','charge','orbit','dart','return','beamWindup','beam','slamWindup','slam','bossChase','bossChargeWindup','bossCharge','bossSlamWindup','bossSlam','bossRingWindup','bossArmWindup','bossArmStrike','bossInkWindup','bossInkBurst','bossRecover','bossDefeated'].includes(e.mode)?e.mode:(e.type==='warden'?'bossChase':'chase');
@@ -1562,27 +1562,32 @@ function gainSuperEnergy(p,amount,style='survival'){
   p.superBuild=sanitizeSuperBuild(p.superBuild);p.superBuild[style]+=amount;
   if(p.superMeter>=100)forgeSuper(p);
 }
-function cryoShatter(p){
-  let ranked=game.enemies.map(e=>({e,d:hypot(e.x-p.x,e.y-p.y)})).sort((a,b)=>a.d-b.d);
-  let targets=ranked.filter(item=>item.d<=CRYO_RADIUS);
-  if(!targets.length&&ranked[0]&&ranked[0].d<=CRYO_RADIUS*1.7)targets=[ranked[0]];
-  for(const item of targets){
-    let e=item.e,falloff=clamp(1-item.d/(CRYO_RADIUS*1.15),.45,1);
-    let duration=e.type==='warden'?WARDEN_CRYO_LOCK*(.82+falloff*.18):CRYO_LOCK*(.86+falloff*.14);
-    e.cryo=Math.max(num(e.cryo),duration);
+function applyCryoAura(p){
+  if(!p||!p.alive||num(p.freezeAura)<=0)return 0;
+  let targets=0;
+  for(const e of game.enemies){
+    if(e.defeated)continue;
+    let distance=hypot(e.x-p.x,e.y-p.y);
+    if(distance>CRYO_RADIUS+num(e.r))continue;
+    e.cryo=Math.max(num(e.cryo),e.type==='warden'?WARDEN_CRYO_AURA_LOCK:CRYO_AURA_LOCK);
     e.stun=0;
-    e.vx*=.08;e.vy*=.08;
+    e.vx*=.2;e.vy*=.2;
     if(e.type==='brute'&&e.armor>0){e.armor=0;e.armorTimer=3.6}
+    targets++;
   }
-  p.freezeAura=POWER_TIMERS.freeze;
+  return targets;
+}
+function startCryoAura(p){
+  p.freezeAura=Math.max(num(p.freezeAura),POWER_TIMERS.freeze);
+  let targets=applyCryoAura(p);
   game.shake=Math.max(game.shake,.09);
-  return targets.length;
+  return targets;
 }
 function applyPower(p,type){
   if(type==='shield')p.shield=1;
   else if(type==='magnet')p.magnet=Math.max(p.magnet,8);
   else if(type==='boost')p.boost=Math.max(p.boost,7);
-  else if(type==='freeze'){cryoShatter(p);gameSound('freeze',p);return}
+  else if(type==='freeze'){startCryoAura(p);gameSound('freeze',p);return}
   else if(type==='repair'){if(p.hp<p.maxHp)p.hp=Math.min(p.maxHp,p.hp+2);else p.shield=1}
   gameSound(type==='shield'?'shieldPickup':type,p);
 }
@@ -2286,7 +2291,8 @@ function tick(dt){
     let recoiling=p.hitTime>0&&p.dt<=0;if(p.dt>0){let dashSpeed=playerDashSpeed(p);p.vx=p.dx*dashSpeed;p.vy=p.dy*dashSpeed;let trailNow=performance.now();if(trailNow-num(p._lastTrailAt,0)>=28){p._lastTrailAt=trailNow;p.trail.push({x:p.x,y:p.y,dx:p.dx,dy:p.dy,at:trailNow,life:280,flame:p.boost>0})}}else{let controlScale=recoiling?.22:1;p.vx=c.x*sp*controlScale+(recoiling?num(p.hitVX):0);p.vy=c.y*sp*controlScale+(recoiling?num(p.hitVY):0)}
     p.x+=p.vx*dt;p.y+=p.vy*dt;let wallContact=collideWorld(p);p._wallContact=wallContact;if(recoiling){let decay=Math.exp(-dt*10.5);p.hitVX*=decay;p.hitVY*=decay;if(wallContact){p.hitVX*=.18;p.hitVY*=.18}}
     if(p.boost>0&&hypot(p.vx,p.vy)>45&&p.fireTrailCd<=0){let l=hypot(p.vx,p.vy)||1,ux=p.vx/l,uy=p.vy/l;addFirePatch(p.x-ux*(p.r+8),p.y-uy*(p.r+8),p.id,false,p.dt>0?24:19,p.dt>0?2.15:1.65);p.fireTrailCd=p.dt>0?.07:.12}
-    updateHazardsForPlayer(p,dt,levelConfig(game.level));for(const coin of game.coins)if(!coin.taken&&hypot(p.x-coin.x,p.y-coin.y)<p.r+coin.r+4)collectCoin(p,coin);for(const item of game.powerups)if(!item.taken&&playerTouchesPower(p,item))collectPower(p,item);for(const e of game.enemies){if(e.defeated)continue;let d=hypot(p.x-e.x,p.y-e.y);if(d<p.r+e.r){if(p.dt>0)dashSmash(p,e);else enemyHitPlayer(p,e,e.type==='warden'?54:e.type==='brute'?40:28)}}
+    if(p.freezeAura>0)applyCryoAura(p);
+    updateHazardsForPlayer(p,dt,levelConfig(game.level));for(const coin of game.coins)if(!coin.taken&&hypot(p.x-coin.x,p.y-coin.y)<p.r+coin.r+4)collectCoin(p,coin);for(const item of game.powerups)if(!item.taken&&playerTouchesPower(p,item))collectPower(p,item);for(const e of game.enemies){if(e.defeated)continue;let d=hypot(p.x-e.x,p.y-e.y);if(d<p.r+e.r){if(p.dt>0)dashSmash(p,e);else if(num(e.cryo)<=0)enemyHitPlayer(p,e,e.type==='warden'?54:e.type==='brute'?40:28)}}
   }
   for(const coin of game.coins)if(!coin.taken){let best=null,bd=190;for(const p of game.players)if(p.alive&&p.connected!==false&&p.magnet>0){let d=hypot(p.x-coin.x,p.y-coin.y);if(d<bd){bd=d;best=p}}if(best){let dx=best.x-coin.x,dy=best.y-coin.y,l=hypot(dx,dy)||1,s=Math.min(310,120+(190-l)*1.2);coin.x+=dx/l*s*dt;coin.y+=dy/l*s*dt;if(l<best.r+coin.r+4)collectCoin(best,coin)}}
   updateFirePatches(dt);updateInkSplats(dt);game.timeStop=Math.max(0,game.timeStop-dt);if(game.superFx){game.superFx.time=Math.max(0,game.superFx.time-dt);if(!game.superFx.time)game.superFx=null}

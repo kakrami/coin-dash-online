@@ -1,15 +1,15 @@
-# Coin Dash Online — Authoritative Server v2.2.1
+# Coin Dash Online — Authoritative Server v2.2.2
 
-This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.5.5. Do not create a new repository.
+This is the existing `coin-dash-online` Cloudflare Worker repository for Coin Dash v1.5.8. Do not create a new repository.
 
 ## Matching versions
 
-- Client: Coin Dash v1.5.5
-- Server: v2.2.1
-- Multiplayer protocol 18
-- Engine revision: `foundry-2026-08-05-r9`
+- Client: Coin Dash v1.5.8
+- Server: v2.2.2
+- Multiplayer protocol 19
+- Engine revision: `foundry-2026-08-05-r10`
 
-Deploy the server first, then deploy the matching client.
+Deploy the server before the matching client because Cryo Shard gameplay behavior changed in the authoritative engine.
 
 ## Production addresses
 
@@ -21,32 +21,32 @@ Expected health values:
 
 ```json
 {
-  "protocol": 18,
-  "version": 15,
-  "engine": "foundry-2026-08-05-r9"
+  "protocol": 19,
+  "version": 16,
+  "engine": "foundry-2026-08-05-r10"
 }
 ```
 
-## v2.2.1 changes
+## v2.2.2 changes
 
-- Active-room counts now require a recent client heartbeat instead of merely trusting an existing WebSocket object.
-- Phone or browser connections that silently die stop counting as active after 45 seconds.
-- Rooms with zero active players are immediately removed from the public server browser.
-- Brand-new players cannot revive a room after every active participant has disappeared; only reserved participants may reconnect during the recovery window.
-- An empty room receives a two-minute reconnect window, then its sockets, stored state, reservations, and directory entry are permanently deleted.
-- Newly created rooms that never connect are also destroyed after the same two-minute window.
-- The 60-second owner reconnect grace period remains unchanged.
-- Multiplayer protocol 18 and engine revision `foundry-2026-08-05-r9` remain compatible with the previous client protocol.
+- Cryo Shard is now a timed moving freeze field instead of a one-time pulse followed by a visual-only circle.
+- Enemies are frozen whenever they enter the visible 225-radius field and thaw shortly after leaving it.
+- Frozen enemies cannot deal contact damage.
+- Freeze duration, radius, enemy state, and contact rules are server authoritative for multiplayer.
+- Multiplayer protocol increased to 19 and engine revision increased to `foundry-2026-08-05-r10`.
 
-## Cloudflare migration
+## Existing room lifecycle behavior
 
-`wrangler.jsonc` adds the `DIRECTORY` Durable Object binding and the `v2` migration for `RoomDirectory`. Upload the entire server folder so Cloudflare applies this migration.
+- Active-room counts require a recent client heartbeat.
+- Silent connections stop counting as active after 45 seconds.
+- Empty rooms disappear from the public browser immediately and are deleted after two minutes.
+- The owner reconnect grace period remains 60 seconds.
 
 ## Phone deployment
 
 1. Upload the five files from `1_SERVER_REPO_UPLOAD` to the root of the existing server repository.
 2. Keep the existing `package-lock.json` if present.
 3. Commit to the production branch connected to Cloudflare.
-4. Confirm the health endpoint shows protocol 18, version 15, and engine revision `foundry-2026-08-05-r9`.
+4. Confirm the health endpoint shows protocol 19, version 16, and engine revision `foundry-2026-08-05-r10`.
 5. Upload the matching client `index.html` to the GitHub Pages repository.
 6. Close and reopen the game on every device.
